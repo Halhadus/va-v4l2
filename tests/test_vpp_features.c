@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <linux/media.h>
 #include "va_v4l2.h"
 #include "page_size.h"
 #include "probe.h"
@@ -14,13 +15,35 @@ static int odd422_stride;
 static struct vav4l2_context *current;
 static struct v4l2_format raw[2];
 static struct v4l2_rect crop, compose;
+static struct vav4l2_context *decoder;
+static int decode_ready, decode_capture_done, decode_output_done, decode_error;
+int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout)
+{
+    if (decoder && timeout > 0) decode_ready = 1;
+    for (nfds_t i = 0; i < count; i++) fds[i].revents = fds[i].events;
+    return count;
+}
 static void expect(int ok, const char *tag)
 {
     if (!ok) { fprintf(stderr, "FAIL %s\n", tag); failures++; }
 }
 static int mock_ioctl(int fd, unsigned long request, void *arg)
 {
-    (void)fd; ioctls++;
+    if (decoder && (request == MEDIA_REQUEST_IOC_QUEUE || request == MEDIA_REQUEST_IOC_REINIT)) return 0;
+    if (decoder && fd == decoder->v4l2_fd) {
+        if (request == VIDIOC_QBUF || request == VIDIOC_STREAMOFF) return 0;
+        if (request == VIDIOC_DQBUF) {
+            struct v4l2_buffer *b = arg;
+            int capture = b->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            int *done = capture ? &decode_capture_done : &decode_output_done;
+            if (!decode_ready || *done) { errno = EAGAIN; return -1; }
+            *done = 1; b->index = 0;
+            if (capture) { b->m.planes[0].bytesused = 192; b->flags = decode_error ? V4L2_BUF_FLAG_ERROR : 0; }
+            return 0;
+        }
+        errno = EINVAL; return -1;
+    }
+    ioctls++;
     if (request == VIDIOC_QUERYCAP) { ((struct v4l2_capability *)arg)->capabilities = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING; return 0; }
     if (request == VIDIOC_TRY_FMT) {
         struct v4l2_format *f = arg; tries++;
@@ -140,6 +163,44 @@ static VAStatus run(struct vav4l2_context *c, VAProcPipelineParameterBuffer *pip
     struct vav4l2_buffer *buffers[] = {&params};
     current = c;
     return vav4l2_vpp_run(c, buffers, 1);
+}
+static void queued_source(int corrupt)
+{
+    struct vav4l2_driver_data dd = {0};
+    unsigned char capture[192], output[192]; memset(capture, 0x61, sizeof(capture)); memset(output, 0xa5, sizeof(output));
+    struct vav4l2_surface src = {.surface_id = 1, .driver_data = &dd, .width = 8, .height = 8, .format = VA_FOURCC_NV12,
+        .status = VASurfaceRendering, .memfd_fd = -1, .buf_index = -1};
+    struct vav4l2_surface dst = {.width = 8, .height = 8, .format = VA_FOURCC_NV12, .cpu_ptr = output, .cpu_stride = 16, .cpu_size = 192};
+    struct vav4l2_context decode = {.codec = VAV4L2_CODEC_VP9, .driver_data = &dd, .context_id = 1, .media_fd = -1, .request_fd = -1,
+        .v4l2_fd = memfd_create("vpp-decoder", MFD_CLOEXEC), .streamed = 1, .width = 8, .height = 8,
+        .output_bufs_allocd = 1, .output_buf_size = 64, .capture_bufs_allocd = 1, .capture_buf_size = 192,
+        .cap_width = 8, .cap_height = 8, .cap_stride = 16, .cap_sizeimage = 192, .cap_pixelformat = V4L2_PIX_FMT_NV12};
+    struct vav4l2_context c = {.codec = VAV4L2_CODEC_VPP, .driver_data = &dd, .current_surface = &dst, .next = &decode,
+        .v4l2_fd = memfd_create("vpp-pending-source", MFD_CLOEXEC)};
+    expect(decode.v4l2_fd >= 0 && c.v4l2_fd >= 0 && !ftruncate(c.v4l2_fd, 2 * vav4l2_test_page_size()), "pending-source-devices");
+    dd.surfaces[1] = &src; dd.contexts = &c;
+    VAProcPipelineParameterBuffer pipe = {.surface = 1};
+    rga3_mode = clamp_selection = 0; decoder = &decode; decode_ready = decode_capture_done = decode_output_done = 0; decode_error = corrupt;
+    int before = submissions;
+    expect(run(&c, &pipe) == VA_STATUS_ERROR_SURFACE_BUSY && submissions == before, "active-picture-without-submission-stays-busy");
+    expect(!vav4l2_request_pipeline_init(&decode) && !vav4l2_request_begin(&decode), "pending-source-request");
+    decode.request_fd = memfd_create("vpp-decode-request", MFD_CLOEXEC);
+    decode.capture_buf_ptr[0] = capture; vav4l2_cap_pool_push(&decode, 0);
+    decode.current_surface = &src; decode.current_surface_id = 1;
+    expect(decode.request_fd >= 0 && vav4l2_decode_submit(&decode, 0, 8, 0) == 0 &&
+        !vav4l2_surface_pull_capture(&decode, &src, 0), "queue-source-before-VPP");
+    decode.current_surface = NULL;
+    expect(!src.has_pic && src.status == VASurfaceRendering && !decode_ready, "source-not-complete-before-VPP");
+    setenv("VAV4L2_VPP_DMABUF", "0", 1);
+    VAStatus status = run(&c, &pipe);
+    if (corrupt) expect(status == VA_STATUS_ERROR_DECODING_ERROR && src.status == VASurfaceSkipped &&
+        submissions == before && output[0] == 0xa5 && !c.vpp_q.valid, "failed-decode-does-not-start-VPP-or-write-target");
+    else expect(status == VA_STATUS_SUCCESS && decode_ready && src.status == VASurfaceReady && src.has_pic &&
+        src.buf_index == 0 && src.capture_ctx == &decode && submissions == before + 1 &&
+        ((unsigned char *)c.vpp_q.out_map[0])[0] == 0x61 && output[0] == 0x33 && output[128] == 0x44,
+        "VPP-waits-for-source-pixels-and-retains-decoder-storage");
+    unsetenv("VAV4L2_VPP_DMABUF"); vav4l2_m2m_teardown(&c, &c.vpp_q);
+    vav4l2_request_finish(&decode); close(decode.v4l2_fd); close(c.v4l2_fd); decoder = NULL;
 }
 int main(void)
 {
@@ -524,5 +585,6 @@ int main(void)
     expect(vav4l2_vpp_extra_rt_formats(&depth) == VA_RT_FORMAT_YUV422_10, "ten-bit-RT-advertisement-follows-output-direction");
     depth.vpp_caps_ready = 0; depth.vpp_devices[0].output[0] = V4L2_PIX_FMT_P010;
     expect(vav4l2_vpp_extra_rt_formats(&depth) == VA_RT_FORMAT_YUV420_10, "P010-only-raw-node-advertises-only-P010-depth");
+    vav4l2_set_ioctl_hook(mock_ioctl); queued_source(0); queued_source(1); vav4l2_set_ioctl_hook(NULL);
     return failures != 0;
 }

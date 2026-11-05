@@ -138,7 +138,7 @@ if get_option('tests')
     'vpp_dmabuf': ['poll'],
     'vpp_dmabuf_probe': [],
     'vpp_extended': ['poll', 'mmap', 'mmap64', 'munmap'],
-    'vpp_features': [],
+    'vpp_features': ['poll'],
   }
   foreach name, symbols : units
     wrap_args = []

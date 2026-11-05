@@ -419,7 +419,22 @@ int main(void)
     assert(table.vaQuerySurfaceStatus(&driver, 0, &status) == VA_STATUS_SUCCESS && status == VASurfaceRendering);
     result(0, 0, 0, 384);
     assert(table.vaQuerySurfaceStatus(&driver, 0, &status) == VA_STATUS_SUCCESS && status == VASurfaceReady);
-    finish(&c, surfaces); driver.pDriverData = original; table.vaTerminate(&driver);
+    finish(&c, surfaces);
+    for (unsigned corrupt = 0; corrupt < 2; corrupt++) {
+        init(&c, &dd, surfaces); c.context_id = 1;
+        struct vav4l2_context processing = {.codec = VAV4L2_CODEC_VPP, .driver_data = &dd, .current_surface = &surfaces[1], .next = &c};
+        dd.contexts = &processing; submit(&c, &surfaces[0], &f, 0);
+        VAProcPipelineParameterBuffer pipe = {.surface = 0, .rotation_state = VA_ROTATION_270 + 1};
+        struct vav4l2_buffer buffer = {.type = VAProcPipelineParameterBufferType, .size = sizeof(pipe), .data = &pipe};
+        struct vav4l2_buffer *batch[] = {&buffer};
+        if (corrupt) result(0, 0, V4L2_BUF_FLAG_ERROR, 0);
+        VAStatus result = vav4l2_vpp_run(&processing, batch, 1);
+        if (corrupt) assert(result == VA_STATUS_ERROR_DECODING_ERROR && surfaces[0].status == VASurfaceSkipped && c.v4l2_fd == -1);
+        else assert(result == VA_STATUS_ERROR_INVALID_PARAMETER && surfaces[0].status == VASurfaceReady && surfaces[0].has_pic &&
+            surfaces[0].capture_ctx == &c && !vav4l2_stateful_pending(&c, 0));
+        finish(&c, surfaces);
+    }
+    driver.pDriverData = original; table.vaTerminate(&driver);
     assert(discovery_calls == 2);
     puts("stateful queue order, drain, deadlines, reconfiguration and VA lifetime: PASS"); return 0;
 }

@@ -546,8 +546,15 @@ static VAStatus run_pipeline(struct vav4l2_context *ctx,
     dst = ctx->current_surface;
     if (!src || !dst)
         return VA_STATUS_ERROR_INVALID_SURFACE;
-    if (src != dst && src->status == VASurfaceRendering)
-        return VA_STATUS_ERROR_SURFACE_BUSY;
+    /* Decode completion selects the input's final CAPTURE backing. */
+    if (src != dst && src->status == VASurfaceRendering) {
+        for (struct vav4l2_context *c = ctx->driver_data->contexts; c; c = c->next) if (vav4l2_decode_pending(c, pipe->surface)) {
+            st = vav4l2_decode_sync(c, src, UINT64_C(5000000000));
+            if (st != VA_STATUS_SUCCESS) return st;
+            break;
+        }
+        if (src->status == VASurfaceRendering) return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
 
     sw = src->width; sh = src->height; dw = dst->width; dh = dst->height;
     VARectangle input = {0, 0, sw, sh}, output = {0, 0, dw, dh};
