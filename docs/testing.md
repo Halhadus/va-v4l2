@@ -40,7 +40,7 @@ The report's `acceptance-plan.json` records selected groups and prerequisites. A
 
 Packed-format VPP fixtures use 128x128 images; format enumeration does not imply that a node accepts a 64x64 job. PRIME3 completion checks cover all 22 public formats once per composed/separate representation, with 32 import/lifetime cycles each.
 
-Selected groups run in native-export and GBM modes. Failures remain failures when a later diagnostic retry passes. The report includes case records from all acceptance TSV files, including renderer and transport checks, and `hardware.tar.gz` with pixel evidence and traces. Counts include both group gates and component checks; they are not counts of independent video streams.
+Selected groups run in native-export and GBM modes. Experimental AV1 matrix vectors follow `VAV4L2_ADVERTISE_AV1=1`; `VAV4L2_TEST_AV1_TILES=1` additionally enables the tiled cases. Failures remain failures when a later diagnostic retry passes. The report includes case records from all acceptance TSV files, including renderer and transport checks, and `hardware.tar.gz` with pixel evidence and traces. Counts include both group gates and component checks; they are not counts of independent video streams.
 
 The full fixture set needs FFmpeg with libx264/libx265/libvpx, `vainfo`, `v4l-utils`, GStreamer tools and bad plugins providing the stateless reference decoders, and EGL/GLES development packages. Device reports under [tested hardware](hardware/README.md) record results for particular kernels.
 
