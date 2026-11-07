@@ -59,7 +59,7 @@ def execute(name, command, output, cwd=ROOT, env=None):
         with subprocess.Popen(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, bufsize=1, start_new_session=True) as child:
             metrics = {'samples': 0, 'peak_rss_kib': 0, 'peak_fds': 0}
             stop = threading.Event(); observer = None
-            if name.startswith('conformance-') and name.endswith(('-hardware', '-software')):
+            if (name.startswith('conformance-') and name.endswith(('-hardware', '-software'))) or (name.startswith('decode-') and not name.endswith('-generate')):
                 observer = threading.Thread(target=sample_process, args=(child.pid, stop, metrics), daemon=True)
                 observer.start()
             try:
@@ -163,10 +163,10 @@ def main(argv=None):
     parser.add_argument("--sanitize", action="store_true")
     parser.add_argument("--manifest", type=Path, help="conformance corpus manifest")
     parser.add_argument("--previous", type=Path, help="previous conformance report for regression checks")
-    parser.add_argument("--repeat", type=int, default=1, help="repeat each conformance stream in one decoder session (1..100000)")
+    parser.add_argument("--repeat", type=int, default=1, help="repeat hardware/smoke/conformance streams in one decoder session (1..100000)")
     args = parser.parse_args(argv)
     if args.suite == "conformance" and not args.manifest: parser.error("conformance requires --manifest")
-    if not 1 <= args.repeat <= 100000 or (args.repeat != 1 and args.suite != "conformance"): parser.error("--repeat requires conformance and a value from 1 to 100000")
+    if not 1 <= args.repeat <= 100000 or (args.repeat != 1 and args.suite not in ("conformance", "hardware", "smoke")): parser.error("--repeat requires hardware, smoke or conformance and a value from 1 to 100000")
     if args.suite != "conformance" and (args.manifest or args.previous): parser.error("--manifest/--previous require --suite conformance")
     build = args.build_dir.resolve(); parent = args.output_dir.resolve(); parent.mkdir(parents=True, exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
@@ -203,7 +203,7 @@ def main(argv=None):
             hardware = importlib.util.module_from_spec(spec); spec.loader.exec_module(hardware)
             # Individual phases are already recorded by run(); attach final pixel
             # results to those same objects and add explicit unsupported cases.
-            for result in hardware.run_hardware(run, output, build, args.render_node, extended=args.suite == "hardware"):
+            for result in hardware.run_hardware(run, output, build, args.render_node, extended=args.suite == "hardware", repeat=args.repeat):
                 if not any(result is old for old in record["suites"]): record["suites"].append(result)
             if any(item["status"] == "FAIL" for item in record["suites"]): record["complete"] = True; return 1
         elif args.suite == "conformance":

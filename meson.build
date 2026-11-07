@@ -104,6 +104,7 @@ if get_option('tests')
     'compatibility': ['vav4l2_compat_modules', 'open', 'open64', 'vav4l2_list_video_nodes'],
     'decode_recovery': ['poll'],
     'decode_reference_state': [],
+    'decode_surface_client': ['ioctl'],
     'decode_trace': ['open', 'open64', 'write'],
     'discovery': ['ioctl', 'scandir', 'scandir64', 'opendir', 'readdir', 'readdir64', 'closedir', 'open', 'open64'],
     'dmabuf_complete_client': ['fork', '_exit', 'pread', 'pread64', 'ioctl', 'mmap', 'mmap64', 'munmap', 'opendir', 'readdir', 'readdir64', 'closedir', 'dirfd'],
@@ -197,6 +198,7 @@ if not get_option('hardware_tests').disabled()
     executable(name, 'tests/' + name + '.c', dependencies: core_deps)
   endforeach
   executable('vpp_dmabuf_probe', 'tests/vpp_dmabuf_probe.c', link_with: core, include_directories: inc, dependencies: core_deps)
+  shared_library('decode_surface_interpose', 'tests/decode_surface_interpose.c', name_prefix: '', install: false, dependencies: core_deps)
   shared_library('prime_surface_interpose', 'tests/prime_surface_interpose.c', name_prefix: '', install: false, dependencies: core_deps + [dl_dep])
 endif
 

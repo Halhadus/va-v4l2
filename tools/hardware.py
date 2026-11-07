@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Capability-selected decode, processing and buffer acceptance checks."""
 import hashlib
+import io
 import json
 import re
 import os
@@ -11,10 +12,14 @@ import tarfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
 from encoder_pool import x265_pool
+from dmabuf_decode_checks import validate_imports, validate_gpu_copies
+from h264_poc_vector import rewrite_poc_type1
 
 # profile, encoder, optional encoder settings. The stream has eight changing frames.
 CODECS = {
     "h264": ("VAProfileH264High", "libx264", ["-profile:v", "high"]),
+    "h264-poc1-cavlc": ("VAProfileH264ConstrainedBaseline", "libx264", ["-profile:v", "baseline", "-x264-params", "threads=1:bframes=0:slices=4"]),
+    "h264-poc1-cabac": ("VAProfileH264Main", "libx264", ["-profile:v", "main", "-x264-params", "threads=1:bframes=0:slices=4"]),
     "hevc": ("VAProfileHEVCMain", "libx265", ["-x265-params", f"pools={x265_pool()}:frame-threads=1:log-level=error"]),
     "hevc10": ("VAProfileHEVCMain10", "libx265", ["-x265-params", f"pools={x265_pool()}:frame-threads=1:log-level=error"]),
     "vp9": ("VAProfileVP9Profile0", "libvpx-vp9", ["-deadline", "realtime", "-cpu-used", "8", "-lag-in-frames", "0"]),
@@ -78,23 +83,46 @@ def select_codecs(capabilities):
     return [name for name, (profile, _, _) in CODECS.items() if profile in supported]
 
 
+def compare_streams(actual, reference, codec, frames=FRAMES):
+    frame_size = WIDTH * HEIGHT * 3 // 2 * (2 if codec in ("hevc10", "vp9-10", "av1-10") else 1)
+    first, changing, maximum, total_error = None, False, 0, 0
+    for frame in range(frames):
+        pixels, expected = actual.read(frame_size), reference.read(frame_size)
+        if len(pixels) != frame_size or len(expected) != frame_size: raise ValueError(f"expected {frames} complete raw frames; truncated frame {frame}")
+        if first is None: first = pixels
+        else: changing |= pixels != first
+        if codec == "mpeg2":
+            errors = [abs(a - b) for a, b in zip(pixels, expected)]
+            maximum = max(maximum, max(errors)); total_error += sum(errors)
+        elif pixels != expected: raise ValueError(f"decoded pixels differ from software reference at frame {frame}")
+    if actual.read(1) or reference.read(1): raise ValueError(f"expected exactly {frames} complete raw frames")
+    if not changing: raise ValueError("decoded frames are static")
+    if codec == "mpeg2" and (maximum > 4 or total_error / (frame_size * frames) > 0.5):
+        raise ValueError("MPEG-2 pixels exceed IDCT tolerance (max 4, mean 0.5)")
+
+
 def compare_pixels(actual, reference, codec):
-    size = WIDTH * HEIGHT * 3 // 2 * FRAMES * (2 if codec in ("hevc10", "vp9-10", "av1-10") else 1)
-    if len(actual) != size or len(reference) != size:
-        raise ValueError(f"expected {FRAMES} complete raw frames ({size} bytes), got {len(actual)}/{len(reference)}")
-    frame_size = size // FRAMES
-    if len({actual[start:start + frame_size] for start in range(0, size, frame_size)}) < 2:
-        raise ValueError("decoded frames are static")
-    if codec == "mpeg2":
-        # Hardware IDCT implementations can round differently from the CPU IDCT.
-        errors = [abs(a - b) for a, b in zip(actual, reference)]
-        if max(errors) > 4 or sum(errors) / size > 0.5:
-            raise ValueError("MPEG-2 pixels exceed IDCT tolerance (max 4, mean 0.5)")
-    elif actual != reference:
-        raise ValueError("decoded pixels differ from software reference")
+    compare_streams(io.BytesIO(actual), io.BytesIO(reference), codec)
 
 
-def run_hardware(run, output, build, render_node, extended=True):
+def validate_exports(paths, minimum):
+    if not paths: raise ValueError("missing pre-sync export trace")
+    exports = 0
+    for path in paths:
+        rows = path.read_text().splitlines()
+        if len(rows) < 2: raise ValueError("incomplete export lifetime trace")
+        count = len(rows) - 1
+        if rows[:-1] != [f"HOLD\t{i}" for i in range(1, count + 1)] or rows[-1] != f"COMPLETE\t{count}":
+            raise ValueError("failed or malformed retained export checks")
+        exports += count
+    if exports < minimum: raise ValueError(f"expected at least {minimum} exported pictures, got {exports}")
+    return exports
+
+
+def run_hardware(run, output, build, render_node, extended=True, repeat=1):
+    if type(repeat) is not int or not 1 <= repeat <= 100000: raise ValueError("repeat must be between 1 and 100000")
+    frames = FRAMES * repeat
+    loop = ["-stream_loop", str(repeat - 1)] if repeat > 1 else []
     env = dict(os.environ, LIBVA_DRIVER_NAME="v4l2", LIBVA_DRIVERS_PATH=str(build), VAV4L2_RENDER_NODE=render_node)
     cases = []
     client = build / "va_capabilities"
@@ -113,23 +141,58 @@ def run_hardware(run, output, build, render_node, extended=True):
             cases.append(skip(name, "ffmpeg is not installed")); continue
         ten_bit = codec in ("hevc10", "vp9-10", "av1-10")
         raw_format = "p010le" if ten_bit else "nv12"
-        clip = output / (codec + ".mkv")
+        poc1 = codec.startswith("h264-poc1-")
+        clip = output / (codec + (".h264" if poc1 else ".mkv"))
         encode = run(name + "-generate", ["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
             f"testsrc2=size={WIDTH}x{HEIGHT}:rate=25", "-frames:v", str(FRAMES), "-c:v", encoder,
             "-threads", "1", *options, "-pix_fmt", "yuv420p10le" if ten_bit else "yuv420p", "-y", str(clip)], env)
         if encode["status"] != "PASS": cases.append(encode); continue
-        reference, actual = output / (codec + "-cpu.yuv"), output / (codec + "-va.yuv")
-        cpu = run(name + "-reference", ["ffmpeg", "-nostdin", "-v", "error", "-hwaccel", "none", "-i", str(clip),
-            "-pix_fmt", raw_format, "-f", "rawvideo", "-y", str(reference)], env)
-        if cpu["status"] != "PASS": cases.append(cpu); continue
-        decode_env = dict(env, VAV4L2_DECODE_TRACE=str(output / (codec + "-decode.tsv")))
-        hardware = run(name, ["ffmpeg", "-nostdin", "-v", "error", "-hwaccel", "vaapi", "-hwaccel_device", render_node,
-            "-hwaccel_output_format", "vaapi", "-i", str(clip), "-vf", "hwdownload,format=" + raw_format, "-f", "rawvideo", "-y", str(actual)], decode_env)
-        if hardware["status"] == "PASS":
-            try: compare_pixels(actual.read_bytes(), reference.read_bytes(), codec)
+        if poc1:
+            try: rewrite_poc_type1(clip)
             except (OSError, ValueError) as error:
-                hardware.update(status="FAIL", exit_code=1, reason=str(error))
-        cases.append(hardware)
+                encode.update(status="FAIL", exit_code=1, reason="POC1 fixture: " + str(error)); cases.append(encode); continue
+        reference, actual = output / (codec + "-cpu.yuv"), output / (codec + "-va.yuv")
+        cpu = run(name + "-reference", ["ffmpeg", "-nostdin", "-v", "error", "-hwaccel", "none", *loop, "-i", str(clip),
+            "-pix_fmt", raw_format, "-fps_mode", "passthrough", "-f", "rawvideo", "-y", str(reference)], env)
+        if cpu["status"] != "PASS": cases.append(cpu); continue
+        variants = [(name, dict(env))]
+        if extended:
+            for native in (True, False):
+                variant = name + ("-export-default" if native else "-export-gbm")
+                shim = build / "decode_surface_interpose.so"
+                if not shim.is_file(): cases.append(skip(variant, "decoder export test client was not built")); continue
+                directory = output / variant; directory.mkdir()
+                exported = dict(env, VAV4L2_EXPORT_TRACE_DIR=str(directory), VAV4L2_EXPBUF_EXPORT="1" if native else "0", VAV4L2_CAPTURE_DMABUF="0")
+                exported["LD_PRELOAD"] = str(shim) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+                variants.append((variant, exported))
+            for canonical in (False, True):
+                variant = name + ("-import-canonical" if canonical else "-import-padded")
+                if canonical and ten_bit: continue
+                shim = build / "prime_surface_interpose.so"
+                if not shim.is_file(): cases.append(skip(variant, "PRIME allocator test client was not built")); continue
+                directory = output / variant; directory.mkdir()
+                imported = dict(env, VAV4L2_PRIME_TRACE_DIR=str(directory), VAV4L2_PRIME_CANONICAL="1" if canonical else "0", VAV4L2_CAPTURE_DMABUF="0")
+                imported["LD_PRELOAD"] = str(shim) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+                variants.append((variant, imported))
+        for variant, decode_env in variants:
+            actual = output / (variant + "-va.yuv")
+            trace = output / (variant + "-decode.tsv")
+            decode_env["VAV4L2_DECODE_TRACE"] = str(trace)
+            result = run(variant, ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-hwaccel", "vaapi", "-hwaccel_device", render_node,
+                "-hwaccel_output_format", "vaapi", *loop, "-i", str(clip), "-vf", "hwdownload,format=" + raw_format, "-fps_mode", "passthrough", "-f", "rawvideo", "-y", str(actual)], decode_env)
+            if result["status"] == "PASS":
+                try:
+                    with actual.open("rb") as pixels, reference.open("rb") as expected: compare_streams(pixels, expected, codec, frames)
+                    evidence = completions(trace)
+                    if sum(evidence.values()) < frames: raise ValueError("missing driver completion evidence")
+                    result.update(completions=evidence, iterations=repeat, frames=frames)
+                    if "VAV4L2_EXPORT_TRACE_DIR" in decode_env:
+                        result["retained_exports"] = validate_exports(list(Path(decode_env["VAV4L2_EXPORT_TRACE_DIR"]).glob("export-*.tsv")), frames)
+                    if "VAV4L2_PRIME_TRACE_DIR" in decode_env:
+                        validate_imports(list(Path(decode_env["VAV4L2_PRIME_TRACE_DIR"]).glob("prime-*.tsv")), 1)
+                        if decode_env.get("VAV4L2_GPU_COPY") == "1": result["gpu_copies"] = validate_gpu_copies(trace, frames)
+                except (OSError, ValueError) as error: result.update(status="FAIL", exit_code=1, reason=str(error))
+            cases.append(result)
     if extended:
         cases.extend(run_processing(run, output, env, capabilities))
         inventory = json.loads((output / "capabilities.json").read_text()) if (output / "capabilities.json").is_file() else {}
