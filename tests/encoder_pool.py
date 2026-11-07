@@ -27,6 +27,9 @@ def x265_pool(max_workers=1, node_root=Path('/sys/devices/system/node')):
         return fallback
     node, count = min(nodes)
     workers = count if max_workers is None else min(count, max_workers)
+    # A bare count keeps x265's pool alive if libnuma reports an empty CPU mask.
+    if node == 0 and len(paths) == 1:
+        return str(workers)
     return ','.join(['-'] * node + [str(workers), '-'])
 
 

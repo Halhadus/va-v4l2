@@ -38,7 +38,7 @@ def main():
               ('hevc-temporal', 'hevc', ['-x265-params', 'pools=none:frame-threads=1:log-level=error:temporal-layers=1'])]
     cases += [('h264-request-poc1-cavlc', 'h264', ['-profile:v', 'baseline', '-x264-params', 'threads=1:bframes=0:slices=4']),
               ('h264-request-poc1-cabac', 'h264', ['-profile:v', 'main', '-x264-params', 'threads=1:bframes=0:slices=4'])]
-    cases += [('hevc-multiple-slices', 'hevc', ['-x265-params', f'pools={x265_pool()}:frame-threads=1:log-level=error:slices=2'])]
+    cases += [('hevc-multiple-slices', 'hevc', ['-x265-params', f'pools={x265_pool()}:frame-threads=1:log-level=warning:slices=2'])]
     if 'libvpx-vp9' in encoders:
         cases += [('vp9-profile0', 'vp9', ['-deadline', 'realtime', '-cpu-used', '8', '-lag-in-frames', '0']),
                   ('vp9-profile2', 'vp9', ['-pix_fmt', 'yuv420p10le', '-deadline', 'realtime', '-cpu-used', '8', '-lag-in-frames', '0'])]

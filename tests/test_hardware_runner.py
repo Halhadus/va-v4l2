@@ -13,6 +13,13 @@ spec.loader.exec_module(hardware)
 
 
 class Hardware(unittest.TestCase):
+    def test_encoder_pool_uses_a_bare_count_for_a_single_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); node = root / 'node0'; node.mkdir(); (node / 'cpulist').write_text('0-3')
+            with patch('encoder_pool.os.sched_getaffinity', return_value={0, 1}):
+                self.assertEqual(x265_pool(node_root=root), '1')
+                self.assertEqual(x265_pool(None, root), '2')
+
     def test_encoder_pool_uses_available_cpus_without_assuming_node_zero(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
