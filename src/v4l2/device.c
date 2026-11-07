@@ -514,6 +514,7 @@ void vav4l2_release_context_device(struct vav4l2_context *ctx)
         }
     }
     vav4l2_release_capture_surfaces(ctx);
+    vav4l2_av1_dpb_model_reset(ctx);
     vav4l2_unmap_capture_buffers(ctx);
 
     if (ctx->v4l2_fd >= 0) {
@@ -913,7 +914,9 @@ int vav4l2_surface_store_capture(struct vav4l2_context *ctx, struct vav4l2_surfa
         return -1;
     }
 
-    if (live_view && vav4l2_expbuf_export_wanted()) {
+    /* AV1 returns CAPTURE to its pool when the last DPB slot is refreshed,
+     * even while the VA surface awaits display. Keep its copy-out snapshot. */
+    if (live_view && ctx->codec != VAV4L2_CODEC_AV1 && vav4l2_expbuf_export_wanted()) {
         /* Skip capture→GBM/memfd memcpy. Chrome EXPBUFs this index.
          * GetImage/Derive read capture_buf_ptr[buf_index] while it is live. */
         surf->has_pic = 1;

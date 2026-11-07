@@ -41,6 +41,7 @@ struct vav4l2_h264_field;
 struct vav4l2_stateful;
 struct vav4l2_requests;
 struct vav4l2_av1_packet;
+struct vav4l2_av1_pending;
 struct gbm_bo;   /* opaque — only gbm.c includes <gbm.h> */
 
 /* Codec identifiers */
@@ -294,12 +295,14 @@ struct vav4l2_context {
     /* 1088: this UAPI's padded v4l2_ctrl_h264_sps is 1048 bytes */
     uint8_t g_ctrl_payload[1088];
 
-    /* AV1 DPB ownership follows validated OBU refresh flags. */
+    /* AV1 DPB ownership follows validated or normalized reference slots. */
     struct {
         /* Kernel-DPB model for the AV1 copy-out release: which capture
          * buffer each reference slot holds, and which surface owns a
          * given buffer (to clear buf_index when it is released). */
-        int model_active;      /* slot model owns releases (parsed truth) */
+        int model_active;      /* slot model owns native CAPTURE releases */
+        int normalized;        /* decoder slots are independent of VA slot numbers */
+        struct vav4l2_av1_pending *pending; /* one decoded picture awaiting a CDF slot */
         int grain_checked, has_grain;
         struct vav4l2_av1_header header;
         int slot_buf[V4L2_AV1_TOTAL_REFS_PER_FRAME];
@@ -498,6 +501,7 @@ int vav4l2_queue_output(struct vav4l2_context *ctx, int buf_index,
  * restored (STREAMOFF reset) — the caller must NOT push back out_buf_idx
  * when this fails.
  */
+int vav4l2_decode_replay(struct vav4l2_context *, int, uint32_t, uint64_t, int);
 int vav4l2_decode_submit(struct vav4l2_context *ctx, int out_buf_idx,
                          uint32_t bytesused, uint64_t timestamp);
 int vav4l2_h264_field_supported(struct vav4l2_context *ctx);

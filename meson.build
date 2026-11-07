@@ -93,7 +93,7 @@ if get_option('tests')
   units = {
     'allocator': ['open', 'open64', 'vav4l2_list_video_nodes'],
     'api_state': ['vav4l2_vp8_translate'],
-    'av1_tiles': ['vav4l2_ensure_capture', 'vav4l2_decode_submit', 'vav4l2_surface_pull_capture'],
+    'av1_tiles': ['vav4l2_ensure_capture', 'vav4l2_decode_submit', 'vav4l2_decode_replay', 'vav4l2_decode_reset', 'vav4l2_surface_pull_capture'],
     'buffer_info': [],
     'buffers': ['vav4l2_scan_all_cached'],
     'capture_dmabuf': ['poll'],

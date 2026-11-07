@@ -575,6 +575,20 @@ int vav4l2_decode_submit(struct vav4l2_context *ctx, int out_buf_idx, uint32_t b
     return decode_submit(ctx, out_buf_idx, bytesused, timestamp, -1, 0);
 }
 
+/* Replay owns a completed native slot; queue it bare before the new request.
+ * Unlike a held field, its previous CAPTURE has already been dequeued. */
+int vav4l2_decode_replay(struct vav4l2_context *ctx, int output, uint32_t bytes, uint64_t timestamp, int capture)
+{
+    if (!ctx || ctx->stateful || ctx->requests || ctx->capture_memory == V4L2_MEMORY_DMABUF ||
+        capture < 0 || capture >= ctx->capture_bufs_allocd || capture >= VAV4L2_MAX_CAPTURE_BUFS ||
+        output < 0 || output >= ctx->output_bufs_allocd || output >= VAV4L2_NUM_OUTPUT_BUFS ||
+        !bytes || bytes > ctx->output_buf_size || ctx->capture_exports[capture].count) return -1;
+    if (vav4l2_decoder_queue_capture(ctx, capture) < 0) { vav4l2_decode_reset(ctx); return -1; }
+    int done = decode_submit(ctx, output, bytes, timestamp, capture, 0);
+    if (done != capture) { vav4l2_decode_reset(ctx); return -1; }
+    return done;
+}
+
 int vav4l2_decode_submit_field(struct vav4l2_context *ctx, int out_buf_idx,
     uint32_t bytesused, uint64_t timestamp, int capture_index, int hold)
 {

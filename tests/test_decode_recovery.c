@@ -9,6 +9,7 @@
 #include "va_v4l2.h"
 
 static int failures, mode, stopped, queued_cap, allocations, releases;
+static int replay_active, replay_captures, replay_outputs;
 static int field_active, field_fault, field_stage, field_outputs, field_captures, field_dequeues, field_requests;
 static struct timeval submitted_time;
 int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout)
@@ -50,9 +51,20 @@ static int fault_ioctl(int fd, unsigned long request, void *arg)
         struct v4l2_buffer *b = arg;
         if (b->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
             queued_cap = b->index;
+            if (replay_active) {
+                replay_captures++;
+                expect(replay_captures == 1 && !replay_outputs && !(b->flags & V4L2_BUF_FLAG_REQUEST_FD), "replay-queues-completed-CAPTURE-bare-once");
+            }
             if (mode == 1 || mode == 7 || mode == 8) { errno = EIO; return -1; }
         }
-        else submitted_time = b->timestamp;
+        else {
+            submitted_time = b->timestamp;
+            if (replay_active) {
+                replay_outputs++;
+                expect(replay_captures == 1 && !(b->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) &&
+                    (b->flags & V4L2_BUF_FLAG_REQUEST_FD), "replay-uses-a-new-request-without-held-field-flags");
+            }
+        }
         return 0;
     }
     if (request == VIDIOC_DQBUF) {
@@ -118,6 +130,35 @@ static void recovery_case(int test_mode)
                "error-does-not-free-claimed-capture");
     }
     vav4l2_set_ioctl_hook(NULL);
+    if (c.request_fd >= 0) close(c.request_fd);
+    if (c.v4l2_fd >= 0) close(c.v4l2_fd);
+}
+static void replay_case(unsigned fault)
+{
+    struct vav4l2_driver_data dd = {0};
+    struct vav4l2_context c = {.codec = VAV4L2_CODEC_AV1, .driver_data = &dd, .output_bufs_allocd = 1, .output_buf_size = 64,
+        .output_plane_len = {64}, .capture_bufs_allocd = 2, .streamed = 1, .media_fd = -1,
+        .cap_width = 16, .cap_height = 16, .cap_stride = 16, .cap_sizeimage = 384, .cap_pixelformat = V4L2_PIX_FMT_NV12};
+    struct vav4l2_surface old = {.surface_id = 1, .buf_index = 1, .capture_ctx = &c};
+    struct vav4l2_surface next = {.surface_id = 2, .buf_index = -1};
+    dd.surfaces[1] = &old; c.current_surface = &next;
+    c.v4l2_fd = open("/dev/null", O_RDWR | O_CLOEXEC); c.request_fd = dup(c.v4l2_fd);
+    c.n_free_cap = 1; c.free_cap_bufs[0] = 0; c.av1.model_active = 1;
+    static const int modes[] = {0, 1, 5, 6, 3, 0, 0}; mode = modes[fault];
+    if (fault == 5) c.capture_exports[1].count = 1;
+    if (fault == 6) c.capture_memory = V4L2_MEMORY_DMABUF;
+    replay_active = 1; replay_captures = replay_outputs = stopped = 0;
+    vav4l2_set_ioctl_hook(fault_ioctl);
+    int result = vav4l2_decode_replay(&c, 0, 8, 1000, 1);
+    if (!fault || fault == 4) {
+        expect(result == 1 && replay_captures == 1 && replay_outputs == 1 && !stopped && c.n_free_cap == 1 &&
+            old.buf_index == 1 && next.buf_index == -1, "replay-completes-old-slot-without-binding-it-to-new-VA-target");
+        if (fault == 4) expect(c.request_fd == -1, "completed-replay-preserves-REINIT-failure-for-request-reallocation");
+    } else if (fault >= 5) expect(result < 0 && !replay_captures && !replay_outputs && !stopped,
+        "replay-rejects-exported-or-client-DMABUF-backing-before-queueing");
+    else expect(result < 0 && stopped == 2 && !c.av1.model_active && c.request_fd == -1 && c.n_free_cap == 1,
+        "replay-queue-or-completion-failure-resets-ownership-and-CDF-state");
+    replay_active = 0; vav4l2_set_ioctl_hook(NULL);
     if (c.request_fd >= 0) close(c.request_fd);
     if (c.v4l2_fd >= 0) close(c.v4l2_fd);
 }
@@ -199,6 +240,7 @@ static void fields_case(int fault, int preclaimed)
 int main(void)
 {
     setenv("VAV4L2_EXPBUF_EXPORT", "1", 1);
+    for (unsigned i = 0; i < 7; i++) replay_case(i);
     for (int i = 0; i <= 8; i++) recovery_case(i);
     for (int i = 20; i <= 28; i++) recovery_case(i);
     vav4l2_set_ioctl_hook(fault_ioctl);

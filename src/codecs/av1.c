@@ -20,6 +20,24 @@
 
 #include "va_v4l2.h"
 
+struct vav4l2_av1_pending {
+    struct v4l2_ctrl_av1_frame frame;
+    struct v4l2_ctrl_av1_film_grain grain;
+    struct v4l2_ctrl_av1_tile_group_entry tiles[32];
+    int parents[8], capture;
+    VASurfaceID surface;
+    uint64_t timestamp;
+    uint32_t bytes;
+    uint8_t data[];
+};
+
+static int av1_pending_reference(const struct vav4l2_context *ctx, const struct vav4l2_surface *s)
+{
+    const struct vav4l2_av1_pending *p = ctx->av1.pending;
+    return p && s && s->surface_id == p->surface && s->timestamp == p->timestamp && s->buf_index == p->capture &&
+        vav4l2_surface_capture_matches(ctx, s) && ctx->av1.buf_owner[p->capture] == p->surface;
+}
+
 static void av1_fill_sequence_params(struct v4l2_ctrl_av1_sequence *seq,
                                      const VADecPictureParameterBufferAV1 *pic)
 {
@@ -88,6 +106,44 @@ static uint32_t av1_surface_order_hint(struct vav4l2_driver_data *dd,
 
     s = vav4l2_surface_by_id(dd, sid);
     return s ? s->order_hint : 0;
+}
+
+/* Locate native CDF state independently of the client's logical slot number. */
+static int av1_reference_slot(const struct vav4l2_context *ctx, const struct vav4l2_surface *s)
+{
+    if (!vav4l2_surface_capture_matches(ctx, s) || ctx->av1.buf_owner[s->buf_index] != s->surface_id) return -1;
+    for (unsigned i = 0; i < V4L2_AV1_TOTAL_REFS_PER_FRAME; i++)
+        if (ctx->av1.slot_buf[i] == s->buf_index) return i;
+    return -1;
+}
+
+/* Raw tiles contain no reference-slot syntax. Normalize the controls to a
+ * decoder-owned slot map, preserving every distinct live VA reference and its
+ * CDF/MV backing. Never overwrite a live CDF to guess the original refresh. */
+static VAStatus av1_normalize_references(const struct vav4l2_context *ctx,
+    const VADecPictureParameterBufferAV1 *p, struct v4l2_ctrl_av1_frame *frame)
+{
+    if (!ctx->av1.model_active) return VA_STATUS_ERROR_UNIMPLEMENTED;
+    int slots[8]; unsigned live = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        slots[i] = -1;
+        if (p->ref_frame_map[i] == VA_INVALID_SURFACE) continue;
+        const struct vav4l2_surface *s = vav4l2_surface_by_id(ctx->driver_data, p->ref_frame_map[i]);
+        slots[i] = av1_reference_slot(ctx, s);
+        if (slots[i] < 0) return VA_STATUS_ERROR_INVALID_SURFACE;
+        live |= 1u << slots[i];
+    }
+    unsigned slot = 0; while (slot < 8 && (live & (1u << slot))) slot++;
+    for (unsigned i = 0; i < 7 && frame->frame_type == V4L2_AV1_INTER_FRAME; i++) {
+        unsigned ref = p->ref_frame_idx[i];
+        if (ref >= 8 || slots[ref] < 0) return VA_STATUS_ERROR_INVALID_SURFACE;
+        frame->ref_frame_idx[i] = slots[ref];
+    }
+    memset(frame->reference_frame_ts, 0, sizeof(frame->reference_frame_ts));
+    for (unsigned i = 0; i < 8; i++) if (slots[i] >= 0)
+        frame->reference_frame_ts[slots[i]] = vav4l2_surface_ts(ctx->driver_data, p->ref_frame_map[i]);
+    frame->refresh_frame_flags = slot < 8 ? 1u << slot : 0;
+    return VA_STATUS_SUCCESS;
 }
 
 /* Spec 7.8 get_relative_dist. VA stores order_hint_bits_minus_1. */
@@ -487,7 +543,7 @@ static VAStatus av1_fill_frame_params(struct v4l2_ctrl_av1_frame *frame,
                                   struct vav4l2_context *ctx,
                                   const uint8_t *span, size_t span_n,
                                   const uint8_t * const *all_spans,
-                                  const uint32_t *all_sizes, struct vav4l2_av1_header *header)
+                                  const uint32_t *all_sizes, struct vav4l2_av1_header *header, int raw_tiles)
 {
     struct vav4l2_driver_data *dd = ctx ? ctx->driver_data : NULL;
     memset(frame, 0, sizeof(*frame));
@@ -655,11 +711,13 @@ static VAStatus av1_fill_frame_params(struct v4l2_ctrl_av1_frame *frame,
             av1_surface_order_hint(dd, sid);
     }
 
-    VAStatus refresh_status = vav4l2_av1_refresh_flags(header, pic, span, span_n, &frame->refresh_frame_flags);
-    for (unsigned si = 0; refresh_status != VA_STATUS_SUCCESS && si < VAV4L2_MAX_SLICE_DATAS; si++)
-        if (all_spans[si] && all_spans[si] != span)
-            refresh_status = vav4l2_av1_refresh_flags(header, pic, all_spans[si], all_sizes[si], &frame->refresh_frame_flags);
-    if (refresh_status != VA_STATUS_SUCCESS) return refresh_status;
+    if (!raw_tiles) {
+        VAStatus refresh_status = vav4l2_av1_refresh_flags(header, pic, span, span_n, &frame->refresh_frame_flags);
+        for (unsigned si = 0; refresh_status != VA_STATUS_SUCCESS && si < VAV4L2_MAX_SLICE_DATAS; si++)
+            if (all_spans[si] && all_spans[si] != span)
+                refresh_status = vav4l2_av1_refresh_flags(header, pic, all_spans[si], all_sizes[si], &frame->refresh_frame_flags);
+        if (refresh_status != VA_STATUS_SUCCESS) return refresh_status;
+    }
 
     frame->flags = header->removal_present ? V4L2_AV1_FRAME_FLAG_BUFFER_REMOVAL_TIME_PRESENT : 0;
     frame->current_frame_id = header->frame_id;
@@ -720,8 +778,9 @@ void vav4l2_av1_dpb_model_reset(struct vav4l2_context *ctx)
 
     if (!ctx)
         return;
-    ctx->av1.model_active = 0;
-    ctx->av1.header.valid = 0;
+    free(ctx->av1.pending); ctx->av1.pending = NULL;
+    ctx->av1.model_active = ctx->av1.normalized = 0;
+    memset(&ctx->av1.header, 0, sizeof(ctx->av1.header));
     for (i = 0; i < V4L2_AV1_TOTAL_REFS_PER_FRAME; i++)
         ctx->av1.slot_buf[i] = -1;
     for (i = 0; i < VAV4L2_MAX_CAPTURE_BUFS; i++)
@@ -798,10 +857,71 @@ VAStatus vav4l2_av1_validate_references(const struct vav4l2_context *ctx, const 
         if (status != VA_STATUS_SUCCESS) return status;
         const struct vav4l2_surface *s = vav4l2_surface_by_id(ctx->driver_data, id);
         if (s == ctx->current_surface) return VA_STATUS_ERROR_INVALID_SURFACE;
-        if (ctx->av1.model_active && (ctx->av1.slot_buf[slot] != s->buf_index ||
-            ctx->av1.buf_owner[s->buf_index] != id)) return VA_STATUS_ERROR_INVALID_SURFACE;
+        if (ctx->av1.model_active && (ctx->av1.normalized ? av1_reference_slot(ctx, s) < 0 && !av1_pending_reference(ctx, s) :
+            ctx->av1.slot_buf[slot] != s->buf_index || ctx->av1.buf_owner[s->buf_index] != id))
+            return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     return VA_STATUS_SUCCESS;
+}
+
+/* Both passes use the same public controls and unchanged tile bytes. */
+static int av1_submit_picture(struct vav4l2_context *ctx, struct v4l2_ctrl_av1_frame *frame,
+    struct v4l2_ctrl_av1_film_grain *grain, struct v4l2_ctrl_av1_tile_group_entry *tiles,
+    const uint8_t *data, uint32_t bytes, uint64_t timestamp, int replay)
+{
+    if (ctx->request_fd < 0 && ctx->media_fd >= 0) ctx->request_fd = vav4l2_request_alloc(ctx->media_fd);
+    if (ctx->request_fd < 0) return -1;
+    struct v4l2_ext_control controls[3]; unsigned n = 0;
+    if (ctx->av1.has_grain) controls[n++] = (struct v4l2_ext_control){.id = V4L2_CID_STATELESS_AV1_FILM_GRAIN, .ptr = grain, .size = sizeof(*grain)};
+    controls[n++] = (struct v4l2_ext_control){.id = V4L2_CID_STATELESS_AV1_FRAME, .p_av1_frame = frame, .size = sizeof(*frame)};
+    controls[n++] = (struct v4l2_ext_control){.id = V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY, .ptr = tiles,
+        .size = sizeof(*tiles) * frame->tile_info.tile_cols * frame->tile_info.tile_rows};
+    struct v4l2_ext_controls batch = {.count = n, .controls = controls};
+    if (vav4l2_codec_controls(ctx, ctx->request_fd, &batch) < 0) return -1;
+    if (!ctx->n_free_out) return -1;
+    int output = ctx->free_out_bufs[--ctx->n_free_out];
+    uint8_t *dst = ctx->output_buf_ptr[output];
+    if (!dst || bytes > ctx->output_buf_size) { vav4l2_out_pool_push(ctx, output); return -1; }
+    memcpy(dst, data, bytes);
+    return replay < 0 ? vav4l2_decode_submit(ctx, output, bytes, timestamp) :
+        vav4l2_decode_replay(ctx, output, bytes, timestamp, replay);
+}
+
+static VAStatus av1_resolve_pending(struct vav4l2_context *ctx, const VADecPictureParameterBufferAV1 *pic, int reset)
+{
+    struct vav4l2_av1_pending *p = ctx->av1.pending;
+    if (!p) return VA_STATUS_SUCCESS;
+    unsigned live = 0; int referenced = 0;
+    for (unsigned i = 0; i < 8 && !reset; i++) {
+        if (pic->ref_frame_map[i] == VA_INVALID_SURFACE) continue;
+        const struct vav4l2_surface *s = vav4l2_surface_by_id(ctx->driver_data, pic->ref_frame_map[i]);
+        if (av1_pending_reference(ctx, s)) { referenced = 1; continue; }
+        int slot = av1_reference_slot(ctx, s);
+        if (slot < 0) return VA_STATUS_ERROR_INVALID_SURFACE;
+        live |= 1u << slot;
+    }
+    if (!referenced) {
+        struct vav4l2_surface *s = vav4l2_surface_by_id(ctx->driver_data, ctx->av1.buf_owner[p->capture]);
+        if (vav4l2_surface_capture_matches(ctx, s) && s->buf_index == p->capture) {
+            s->buf_index = -1; s->cap_view = NULL; s->capture_ctx = NULL;
+        }
+        ctx->av1.buf_owner[p->capture] = VA_INVALID_SURFACE; vav4l2_cap_pool_push(ctx, p->capture);
+        ctx->av1.pending = NULL; free(p); return VA_STATUS_SUCCESS;
+    }
+    unsigned slot = 0; while (slot < 8 && (live & (1u << slot))) slot++;
+    if (slot == 8 || ctx->capture_memory == V4L2_MEMORY_DMABUF || ctx->capture_exports[p->capture].count)
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    if (memcmp(p->parents, ctx->av1.slot_buf, sizeof(p->parents))) return VA_STATUS_ERROR_INVALID_SURFACE;
+    struct v4l2_ctrl_av1_frame frame = p->frame; frame.refresh_frame_flags = 1u << slot;
+    /* Reset may free codec state during submission. Keep this owned payload
+     * local until the synchronous replay has completed or failed. */
+    ctx->av1.pending = NULL;
+    vav4l2_decode_trace(ctx, "av1-reference-replay", 0, frame.refresh_frame_flags);
+    int done = av1_submit_picture(ctx, &frame, &p->grain, p->tiles, p->data, p->bytes, p->timestamp, p->capture);
+    if (done != p->capture) { free(p); vav4l2_decode_reset(ctx); return VA_STATUS_ERROR_DECODING_ERROR; }
+    struct vav4l2_surface *s = vav4l2_surface_by_id(ctx->driver_data, p->surface);
+    av1_release_unrefd(ctx, s, done, frame.refresh_frame_flags);
+    free(p); return VA_STATUS_SUCCESS;
 }
 
 VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
@@ -828,8 +948,7 @@ VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
     for (i = 0; i < cb.n_slice_params && i < 32; i++)
         tile_params[i] = cb.slice_params[i];
     n_tiles = cb.n_slice_params;
-    /* Largest slice-data buffer — ffmpeg's AV1 VAAPI hwaccel submits the
-     * whole OBU in one buffer. */
+    /* FFmpeg supplies raw tile bytes here; complete OBUs are optional. */
     tile_data = (uint8_t *)cb.largest;
     tile_data_size = cb.largest_size;
     if (!pic_param) {
@@ -869,16 +988,23 @@ VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
 
     av1_fill_sequence_params(&seq, pic_param);
     struct vav4l2_av1_header header = ctx->av1.header;
+    unsigned type = pic_param->pic_info_fields.bits.frame_type;
+    int reset = type == V4L2_AV1_SWITCH_FRAME || (type == V4L2_AV1_KEY_FRAME && pic_param->pic_info_fields.bits.show_frame);
+    int raw_tiles = type == V4L2_AV1_INTER_FRAME && !header.valid && n_tiles == 1 && !tile_start && tile_length == tile_data_size;
+    int normalized = !reset && (ctx->av1.normalized || raw_tiles);
     VAStatus frame_status = av1_fill_frame_params(&frame, pic_param, ctx,
                           (const uint8_t *)cb.largest, cb.largest_size,
-                          cb.slice_datas, cb.slice_sizes, &header);
+                          cb.slice_datas, cb.slice_sizes, &header, raw_tiles);
+    if (frame_status == VA_STATUS_SUCCESS) frame_status = av1_resolve_pending(ctx, pic_param, reset);
+    if (frame_status == VA_STATUS_SUCCESS && normalized) frame_status = av1_normalize_references(ctx, pic_param, &frame);
     if (frame_status != VA_STATUS_SUCCESS) return frame_status;
     frame.tile_info = tile_info;
+    if (normalized) vav4l2_decode_trace(ctx, "av1-reference-slots", 0, frame.refresh_frame_flags);
 
-    int request_fd = ctx->request_fd;
     int v4l2_fd = ctx->v4l2_fd;
 
-    if (request_fd < 0) {
+    if (ctx->request_fd < 0 && ctx->media_fd >= 0) ctx->request_fd = vav4l2_request_alloc(ctx->media_fd);
+    if (ctx->request_fd < 0) {
         fprintf(stderr, "v4l2: AV1 no request fd available\n");
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
@@ -921,6 +1047,7 @@ VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
         }
     }
 
+    if (normalized && !ctx->av1.model_active) return VA_STATUS_ERROR_UNIMPLEMENTED;
     if (!ctx->streamed) {
         if (vav4l2_streamon(v4l2_fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) < 0 ||
             vav4l2_streamon(v4l2_fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) < 0) {
@@ -974,94 +1101,51 @@ VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
         grain.cb_offset = fg->cb_offset;
         grain.cr_offset = fg->cr_offset;
     }
-    struct v4l2_ext_control req_ctrls[3];
-    unsigned n_req_ctrls = 0;
-
-    memset(req_ctrls, 0, sizeof(req_ctrls));
-    if (ctx->av1.has_grain) {
-        req_ctrls[n_req_ctrls].id = V4L2_CID_STATELESS_AV1_FILM_GRAIN;
-        req_ctrls[n_req_ctrls].ptr = &grain;
-        req_ctrls[n_req_ctrls].size = sizeof(grain);
-        n_req_ctrls++;
+    struct vav4l2_av1_pending *pending = NULL;
+    if (normalized && !frame.refresh_frame_flags) {
+        if (!ctx->current_surface || ctx->capture_memory == V4L2_MEMORY_DMABUF) return VA_STATUS_ERROR_UNIMPLEMENTED;
+        pending = calloc(1, sizeof(*pending) + tile_length);
+        if (!pending) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        pending->frame = frame; pending->grain = grain; pending->bytes = tile_length;
+        memcpy(pending->tiles, entries, sizeof(entries[0]) * pic_param->tile_cols * pic_param->tile_rows);
+        memcpy(pending->parents, ctx->av1.slot_buf, sizeof(pending->parents));
+        memcpy(pending->data, tile_data + tile_start, tile_length);
     }
-
-    req_ctrls[n_req_ctrls].id = V4L2_CID_STATELESS_AV1_FRAME;
-    req_ctrls[n_req_ctrls].p_av1_frame = &frame;
-    req_ctrls[n_req_ctrls].size = sizeof(frame);
-    n_req_ctrls++;
-
-    req_ctrls[n_req_ctrls].id = V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY;
-    req_ctrls[n_req_ctrls].ptr = entries;
-    req_ctrls[n_req_ctrls].size = sizeof(entries[0]) * pic_param->tile_cols * pic_param->tile_rows;
-    n_req_ctrls++;
-
-    {
-        struct v4l2_ext_controls req_ctrls_batch = { 0 };
-        req_ctrls_batch.controls = req_ctrls;
-        req_ctrls_batch.count = n_req_ctrls;
-        /* One S_EXT_CTRLS per frame. Failure is terminal — no per-control
-         * fallback. Submitted before the output-buffer pop so a failure
-         * has no pool state to unwind. */
-        if (vav4l2_codec_controls(ctx, request_fd, &req_ctrls_batch) < 0) {
-            fprintf(stderr, "v4l2: failed to set AV1 request controls\n");
-            return VA_STATUS_ERROR_OPERATION_FAILED;
-        }
-    }
-
-    /*
-     * Synchronous decode pipeline - mirrors H.264/HEVC: pop from pools,
-     * queue, submit, wait, attach the frame to the surface.
-     */
-    if (ctx->n_free_out == 0) {
-        fprintf(stderr, "v4l2: AV1 no free output buffer\n");
-        return VA_STATUS_ERROR_OPERATION_FAILED;
-    }
-    int out_buf_idx = ctx->free_out_bufs[--ctx->n_free_out];
-
     uint64_t timestamp = ctx->current_surface ? ctx->current_surface->timestamp : 0;
-
-    /* Preserve the size fields between tiles. The validated entries are
-     * rebased to the first tile payload, matching the kernel stream base. */
-    uint8_t *dst = ctx->output_buf_ptr[out_buf_idx];
-    if (!dst || tile_length > ctx->output_buf_size) {
-        vav4l2_out_pool_push(ctx, out_buf_idx);
-        return VA_STATUS_ERROR_OPERATION_FAILED;
-    }
-    memcpy(dst, tile_data + tile_start, tile_length);
-    tile_data_size = tile_length;
-
-    /* On failure decode_submit resets both queues — do not push back. */
-    int done_cap = vav4l2_decode_submit(ctx, out_buf_idx, tile_data_size, timestamp);
+    int done_cap = av1_submit_picture(ctx, &frame, &grain, entries, tile_data + tile_start, tile_length, timestamp, -1);
     if (done_cap == -2) {
+        free(pending);
         /* Corrupt frame (V4L2_BUF_FLAG_ERROR): mark and succeed — a failed
          * entrypoint would be cached by Chrome for the whole session. */
         if (ctx->current_surface)
             ctx->current_surface->status = VASurfaceSkipped;
         return VA_STATUS_SUCCESS;
     }
-    if (done_cap < 0)
-        return VA_STATUS_ERROR_OPERATION_FAILED;
+    if (done_cap < 0) { free(pending); return VA_STATUS_ERROR_OPERATION_FAILED; }
 
     struct vav4l2_surface *surf = ctx->current_surface;
     if (surf) {
         if (vav4l2_surface_pull_capture(ctx, surf, done_cap) < 0) {
+            free(pending);
             fprintf(stderr, "v4l2: AV1 pull capture failed\n");
             vav4l2_cap_pool_push(ctx, done_cap);
             return VA_STATUS_ERROR_OPERATION_FAILED;
         } else {
             surf->order_hint = pic_param->order_hint;
-            ctx->av1.model_active = 1; ctx->av1.header = header;
+            ctx->av1.model_active = 1; ctx->av1.header = header; ctx->av1.normalized = normalized;
             if (vav4l2_debug)
                 fprintf(stderr, "v4l2: AV1 frame surf=%#x oh=%u buf=%d refresh=%02x type=%u\n",
                         surf->surface_id, pic_param->order_hint, done_cap,
                         frame.refresh_frame_flags,
                         pic_param->pic_info_fields.bits.frame_type);
-            if (ctx->av1.model_active)
-                av1_release_unrefd(ctx, surf, done_cap,
-                                   frame.refresh_frame_flags);
+            if (pending) {
+                pending->capture = done_cap; pending->surface = surf->surface_id; pending->timestamp = surf->timestamp;
+                ctx->av1.buf_owner[done_cap] = surf->surface_id; ctx->av1.pending = pending;
+                vav4l2_decode_trace(ctx, "av1-reference-deferred", 0, done_cap);
+            } else av1_release_unrefd(ctx, surf, done_cap, frame.refresh_frame_flags);
         }
     } else {
-        vav4l2_cap_pool_push(ctx, done_cap);
+        free(pending); vav4l2_cap_pool_push(ctx, done_cap);
     }
 
     return VA_STATUS_SUCCESS;
