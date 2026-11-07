@@ -607,6 +607,8 @@ int vav4l2_gbm_surface_upload(struct vav4l2_surface *s, const void *src,
 void vav4l2_gbm_surface_destroy(struct vav4l2_surface *s);
 VAStatus vav4l2_surface_fill_prime_gbm(const struct vav4l2_surface *surf,
                                        uint32_t flags, void *descriptor);
+int vav4l2_capture_budget_bytes(uint64_t bytes);
+int vav4l2_capture_budget(struct vav4l2_context *, const struct v4l2_pix_format_mplane *, unsigned count, int allocated);
 unsigned vav4l2_capture_layout_planes(uint32_t);
 uint32_t vav4l2_capture_layout_format(uint32_t);
 int vav4l2_capture_layout_set(struct vav4l2_context *, const struct v4l2_pix_format_mplane *);

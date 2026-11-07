@@ -364,11 +364,17 @@ static int setup_capture_queue(struct vav4l2_context *ctx, int fd, int width, in
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     req.memory = V4L2_MEMORY_MMAP;
 
+    if (vav4l2_capture_budget(ctx, &fmt.fmt.pix_mp, req.count, 0) < 0) return -1;
     if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
         fprintf(stderr, "v4l2: REQBUFS capture failed: %s\n", strerror(errno));
         return -1;
     }
 
+    if (ctx && vav4l2_capture_budget(ctx, &fmt.fmt.pix_mp, req.count, 1) < 0) {
+        int error = errno; req.count = 0;
+        if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) return -1;
+        errno = error; return -1;
+    }
     fprintf(stderr, "v4l2: capture queue: %d buffers\n", req.count);
     return req.count < VAV4L2_MAX_CAPTURE_BUFS ? req.count : VAV4L2_MAX_CAPTURE_BUFS;
 }

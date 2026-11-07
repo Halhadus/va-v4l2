@@ -86,6 +86,44 @@ static void layouts(void)
         munmap(map, 3 * plane_step); close(native_fd);
     }
 }
+static void contiguous(void)
+{
+    const uint32_t formats[] = {V4L2_PIX_FMT_NV21, V4L2_PIX_FMT_NV61, V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_YVU420, V4L2_PIX_FMT_YUV422P};
+    plane_count = 1; plane_step = 65536;
+    for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+        unsigned full = f == 1 || f == 4, planar = f >= 2, swapped = f == 0 || f == 1 || f == 3;
+        unsigned chroma_rows = full ? 256 : 128, chroma_pitch = planar ? 40 : 80, chroma_width = planar ? 32 : 64;
+        plane_length[0] = 80 * 256 + chroma_pitch * chroma_rows * (planar ? 2 : 1);
+        native_fd = memfd_create("contiguous-native", MFD_CLOEXEC); assert(native_fd >= 0 && !ftruncate(native_fd, plane_step));
+        uint8_t *map = mmap(NULL, plane_step, PROT_READ | PROT_WRITE, MAP_SHARED, native_fd, 0); assert(map != MAP_FAILED);
+        memset(map, 0xa5, plane_step);
+        for (unsigned y = 0; y < 256; y++) for (unsigned x = 0; x < 64; x++) map[y * 80 + x] = x * 3 + y * 7;
+        for (unsigned p = 0; p < (planar ? 2u : 1u); p++) for (unsigned y = 0; y < chroma_rows; y++) for (unsigned x = 0; x < chroma_width; x++)
+            map[80 * 256 + p * chroma_pitch * chroma_rows + y * chroma_pitch + x] = (1 + ((planar ? p : x & 1) ^ swapped)) * 61 + (planar ? x : x / 2) * 3 + y * 7;
+        struct vav4l2_context ctx = {.v4l2_fd = native_fd, .capture_bufs_allocd = 1};
+        struct v4l2_pix_format_mplane fmt = {.width = 64, .height = 256, .field = V4L2_FIELD_NONE, .pixelformat = formats[f], .num_planes = 1};
+        fmt.plane_fmt[0].bytesperline = 80; fmt.plane_fmt[0].sizeimage = plane_length[0] - 1;
+        assert(vav4l2_capture_layout_set(&ctx, &fmt) < 0 && !ctx.capture_layout);
+        fmt.plane_fmt[0].sizeimage++; fmt.plane_fmt[0].bytesperline = 81;
+        if (planar) assert(vav4l2_capture_layout_set(&ctx, &fmt) < 0 && !ctx.capture_layout);
+        fmt.plane_fmt[0].bytesperline = 80;
+        assert(!vav4l2_capture_layout_set(&ctx, &fmt) && !vav4l2_capture_layout_exportable(&ctx));
+        assert(!vav4l2_decoder_queue_capture(&ctx, 0));
+        struct v4l2_buffer done;
+        assert(!vav4l2_decoder_dequeue_capture(&ctx, &done) && done.bytesused == ctx.cap_sizeimage);
+        mode = 1; assert(vav4l2_decoder_dequeue_capture(&ctx, &done) < 0); mode = 0;
+        struct vav4l2_surface surface = {.width = 64, .height = 256, .format = full ? VA_FOURCC_YUY2 : VA_FOURCC_NV12, .memfd_fd = -1};
+        assert(!vav4l2_capture_layout_pull(&ctx, &surface, 0));
+        const uint8_t *canonical = ctx.capture_buf_ptr[0];
+        for (unsigned y = 0; y < 256; y++) for (unsigned x = 0; x < 64; x++) assert(canonical[y * ctx.cap_stride + x] == (uint8_t)(x * 3 + y * 7));
+        canonical += ctx.cap_stride * 256;
+        for (unsigned y = 0; y < chroma_rows; y++) for (unsigned x = 0; x < 64; x++)
+            assert(canonical[y * ctx.cap_stride + x] == (uint8_t)((1 + (x & 1)) * 61 + x / 2 * 3 + y * 7));
+        surface.cap_view = NULL; vav4l2_unmap_capture_buffers(&ctx);
+        free(surface.cpu_ptr); if (surface.memfd_fd >= 0) close(surface.memfd_fd);
+        munmap(map, plane_step); close(native_fd);
+    }
+}
 int main(void)
 {
     plane_step = vav4l2_test_page_align(2048);
@@ -133,6 +171,6 @@ int main(void)
     s.cap_view = NULL; vav4l2_unmap_capture_buffers(&ctx); assert(!ctx.capture_layout && !ctx.capture_buf_ptr[0]);
     munmap(native, 2 * plane_step); close(native_fd);
     for (unsigned p = 0; p < 2; p++) close(exported[p]);
-    layouts(); vav4l2_set_ioctl_hook(NULL);
+    layouts(); contiguous(); vav4l2_set_ioctl_hook(NULL);
     puts("Planar capture pitches, tile addressing, native objects, LAST and atomic export: PASS"); return 0;
 }

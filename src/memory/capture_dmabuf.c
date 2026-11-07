@@ -71,6 +71,7 @@ int vav4l2_capture_dma_setup(struct vav4l2_context *ctx, unsigned width, unsigne
         if (ret <= 0) { capture_trace(ctx, "pool-layout-fallback", -1, ret < 0 ? errno : EINVAL); return required ? -1 : 0; }
         close(fd);
     }
+    if (vav4l2_capture_budget(ctx, f, count, 0) < 0) return -1;
     struct v4l2_requestbuffers req = {.type = fmt.type, .memory = V4L2_MEMORY_DMABUF, .count = count};
     if (vav4l2_xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req) < 0) {
         capture_trace(ctx, "REQBUFS-fallback", -1, errno);
@@ -82,6 +83,11 @@ int vav4l2_capture_dma_setup(struct vav4l2_context *ctx, unsigned width, unsigne
         return required ? -1 : 0;
     }
     if (!req.count) return required ? -1 : 0;
+    if (vav4l2_capture_budget(ctx, f, req.count, 0) < 0) {
+        int error = errno; req.count = 0;
+        if (vav4l2_xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req) < 0) return -1;
+        errno = error; return -1;
+    }
     ctx->capture_memory = V4L2_MEMORY_DMABUF;
     ctx->cap_width = f->width; ctx->cap_height = f->height; ctx->cap_stride = f->plane_fmt[0].bytesperline;
     ctx->cap_sizeimage = ctx->capture_buf_size = f->plane_fmt[0].sizeimage; ctx->cap_pixelformat = fourcc;

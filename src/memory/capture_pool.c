@@ -27,14 +27,18 @@ int vav4l2_capture_pool_setup(struct vav4l2_context *ctx, unsigned width, unsign
          f->pixelformat != V4L2_PIX_FMT_NV16 && f->pixelformat != V4L2_PIX_FMT_NV20) ||
         !vav4l2_capture_plane_size(f->pixelformat, stride, f->height) ||
         size < vav4l2_capture_plane_size(f->pixelformat, stride, f->height)) return 0;
+    if (vav4l2_capture_budget(ctx, f, count, 0) < 0) return -1;
     struct v4l2_requestbuffers req = {.type = fmt.type, .memory = V4L2_MEMORY_DMABUF, .count = count};
     if (vav4l2_xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req) < 0) return 0;
     if (req.count < count || req.count > VAV4L2_MAX_CAPTURE_BUFS) goto fail;
+    uint64_t allocated = 0;
     for (unsigned i = 0; i < req.count; i++) {
         unsigned rows = (unsigned)(((uint64_t)size + stride - 1) / stride), actual;
         int fd = vav4l2_alloc_shared_storage(stride, rows);
         if (fd < 0) goto fail;
         if (vav4l2_export_fd_validate(fd, size, &actual) < 0) { close(fd); goto fail; }
+        allocated += actual;
+        if (vav4l2_capture_budget_bytes(allocated) < 0) { close(fd); goto fail; }
         struct stat object;
         if (fstat(fd, &object) < 0) { close(fd); goto fail; }
         for (unsigned j = 0; j < i; j++) {

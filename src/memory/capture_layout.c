@@ -9,13 +9,15 @@
 #include <drm_fourcc.h>
 #include "va_v4l2.h"
 struct vav4l2_capture_layout {
-    uint32_t fourcc, canonical, planes, tile_width, tile_height;
-    uint32_t stride[3], size[3], rows[3];
+    uint32_t fourcc, canonical, planes, components, tile_width, tile_height;
+    uint32_t stride[3], size[3], rows[3], object[3], offset[3], needed[3];
     struct { void *map; uint32_t length; } buffers[VAV4L2_MAX_CAPTURE_BUFS][3];
 };
 unsigned vav4l2_capture_layout_planes(uint32_t f)
 {
     switch (f) {
+    case V4L2_PIX_FMT_NV21: case V4L2_PIX_FMT_NV61:
+    case V4L2_PIX_FMT_YUV420: case V4L2_PIX_FMT_YVU420: case V4L2_PIX_FMT_YUV422P: return 1;
     case V4L2_PIX_FMT_NV12M: case V4L2_PIX_FMT_NV21M:
     case V4L2_PIX_FMT_NV16M: case V4L2_PIX_FMT_NV61M:
     case V4L2_PIX_FMT_NV12MT_16X16: case V4L2_PIX_FMT_NV12M_8L128: return 2;
@@ -27,7 +29,7 @@ unsigned vav4l2_capture_layout_planes(uint32_t f)
 uint32_t vav4l2_capture_layout_format(uint32_t f)
 {
     if (!vav4l2_capture_layout_planes(f)) return 0;
-    return f == V4L2_PIX_FMT_NV16M || f == V4L2_PIX_FMT_NV61M ||
+    return f == V4L2_PIX_FMT_NV61 || f == V4L2_PIX_FMT_YUV422P || f == V4L2_PIX_FMT_NV16M || f == V4L2_PIX_FMT_NV61M ||
         f == V4L2_PIX_FMT_YUV422M || f == V4L2_PIX_FMT_YVU422M ? V4L2_PIX_FMT_NV16 : V4L2_PIX_FMT_NV12;
 }
 int vav4l2_capture_layout_set(struct vav4l2_context *ctx, const struct v4l2_pix_format_mplane *f)
@@ -39,15 +41,23 @@ int vav4l2_capture_layout_set(struct vav4l2_context *ctx, const struct v4l2_pix_
         .canonical = vav4l2_capture_layout_format(f->pixelformat)};
     if (f->pixelformat == V4L2_PIX_FMT_NV12MT_16X16) { layout.tile_width = 16; layout.tile_height = 16; }
     if (f->pixelformat == V4L2_PIX_FMT_NV12M_8L128) { layout.tile_width = 8; layout.tile_height = 128; }
-    for (unsigned i = 0; i < planes; i++) {
-        layout.stride[i] = f->plane_fmt[i].bytesperline; layout.size[i] = f->plane_fmt[i].sizeimage;
+    layout.components = planes == 1 ? (f->pixelformat == V4L2_PIX_FMT_NV21 || f->pixelformat == V4L2_PIX_FMT_NV61 ? 2 : 3) : planes;
+    if (planes == 1 && layout.components == 3 && (f->plane_fmt[0].bytesperline & 1)) { errno = EINVAL; return -1; }
+    for (unsigned i = 0; i < planes; i++) layout.size[i] = f->plane_fmt[i].sizeimage;
+    for (unsigned i = 0; i < layout.components; i++) {
+        unsigned object = planes == 1 ? 0 : i;
+        layout.object[i] = object;
+        layout.stride[i] = f->plane_fmt[object].bytesperline / (planes == 1 && layout.components == 3 && i ? 2 : 1);
         layout.rows[i] = i && layout.canonical == V4L2_PIX_FMT_NV12 ? (f->height + 1) / 2 : f->height;
-        unsigned width = i && planes == 3 ? f->width / 2 : f->width;
+        unsigned width = i && layout.components == 3 ? f->width / 2 : f->width;
         if (layout.tile_height) {
             if ((layout.stride[i] % layout.tile_width) || (f->height % layout.tile_height)) { errno = EINVAL; return -1; }
             layout.rows[i] = (layout.rows[i] + layout.tile_height - 1) / layout.tile_height * layout.tile_height;
         }
-        if (layout.stride[i] < width || (uint64_t)layout.stride[i] * layout.rows[i] > layout.size[i]) { errno = EINVAL; return -1; }
+        layout.offset[i] = layout.needed[object];
+        uint64_t end = (uint64_t)layout.offset[i] + (uint64_t)layout.stride[i] * layout.rows[i];
+        if (layout.stride[i] < width || end > layout.size[object]) { errno = EINVAL; return -1; }
+        layout.needed[object] = end;
     }
     uint32_t canonical_size = vav4l2_capture_plane_size(layout.canonical, layout.stride[0], f->height);
     if (!canonical_size) { errno = EINVAL; return -1; }
@@ -97,7 +107,7 @@ int vav4l2_decoder_dequeue_capture(struct vav4l2_context *ctx, struct v4l2_buffe
         used |= planes[i].bytesused;
     }
     if (!(b.flags & V4L2_BUF_FLAG_ERROR) && (used || !(b.flags & V4L2_BUF_FLAG_LAST))) for (unsigned i = 0; i < b.length; i++) {
-        uint32_t need = ctx->capture_layout ? ctx->capture_layout->stride[i] * ctx->capture_layout->rows[i] :
+        uint32_t need = ctx->capture_layout ? ctx->capture_layout->needed[i] :
             memory == V4L2_MEMORY_DMABUF ? ctx->cap_sizeimage : vav4l2_capture_plane_size(ctx->cap_pixelformat, ctx->cap_stride, ctx->cap_height);
         if (!need || planes[i].bytesused < need) { errno = EIO; return -1; }
     }
@@ -165,20 +175,21 @@ int vav4l2_capture_layout_pull(struct vav4l2_context *ctx, struct vav4l2_surface
     }
     dst += (size_t)ctx->cap_stride * ctx->cap_height;
     unsigned rows = layout->canonical == V4L2_PIX_FMT_NV16 ? ctx->cap_height : (ctx->cap_height + 1) / 2;
-    int swapped = layout->fourcc == V4L2_PIX_FMT_NV21M || layout->fourcc == V4L2_PIX_FMT_NV61M ||
+    int swapped = layout->fourcc == V4L2_PIX_FMT_NV21 || layout->fourcc == V4L2_PIX_FMT_NV61 ||
+        layout->fourcc == V4L2_PIX_FMT_YVU420 || layout->fourcc == V4L2_PIX_FMT_NV21M || layout->fourcc == V4L2_PIX_FMT_NV61M ||
         layout->fourcc == V4L2_PIX_FMT_YVU420M || layout->fourcc == V4L2_PIX_FMT_YVU422M;
     for (unsigned y = 0; y < rows; y++) {
-        if (!layout->tile_width && layout->planes == 2 && !swapped) {
-            memcpy(dst + (size_t)y * ctx->cap_stride, (const uint8_t *)layout->buffers[index][1].map + (size_t)y * layout->stride[1], width); continue;
+        if (!layout->tile_width && layout->components == 2 && !swapped) {
+            memcpy(dst + (size_t)y * ctx->cap_stride, (const uint8_t *)layout->buffers[index][layout->object[1]].map + layout->offset[1] + (size_t)y * layout->stride[1], width); continue;
         }
         for (unsigned x = 0; x < width; x++) {
-            unsigned plane = layout->planes == 3 ? 1 + ((x & 1) ^ swapped) : 1;
-            unsigned column = layout->planes == 3 ? x / 2 : x ^ swapped;
+            unsigned plane = layout->components == 3 ? 1 + ((x & 1) ^ swapped) : 1;
+            unsigned column = layout->components == 3 ? x / 2 : x ^ swapped;
             size_t at = (size_t)y * layout->stride[plane] + column;
             if (layout->tile_width) at = (size_t)(y / layout->tile_height) * layout->stride[plane] * layout->tile_height +
                 (size_t)(column / layout->tile_width) * layout->tile_width * layout->tile_height +
                 (y % layout->tile_height) * layout->tile_width + column % layout->tile_width;
-            dst[(size_t)y * ctx->cap_stride + x] = ((const uint8_t *)layout->buffers[index][plane].map)[at];
+            dst[(size_t)y * ctx->cap_stride + x] = ((const uint8_t *)layout->buffers[index][layout->object[plane]].map)[layout->offset[plane] + at];
         }
     }
     return vav4l2_surface_store_capture(ctx, s, index, ctx->capture_buf_ptr[index], ctx->cap_sizeimage, 1);

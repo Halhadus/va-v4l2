@@ -161,9 +161,15 @@ static int setup_capture(struct vav4l2_context *ctx)
         count = minimum.value + 16;
         if (count > VAV4L2_MAX_CAPTURE_BUFS) count = VAV4L2_MAX_CAPTURE_BUFS;
     } else if (errno != EINVAL && errno != ENOTTY) return -1;
+    if (vav4l2_capture_budget(ctx, p, count, 0) < 0) return -1;
     struct v4l2_requestbuffers request = {.type = f.type, .memory = V4L2_MEMORY_MMAP, .count = count};
     if (vav4l2_xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &request) < 0) return -1;
     if (!request.count || request.count > VAV4L2_MAX_CAPTURE_BUFS || request.count < (unsigned)(minimum.value > 0 ? minimum.value + 4 : 4)) { errno = ENOBUFS; return -1; }
+    if (vav4l2_capture_budget(ctx, p, request.count, 1) < 0) {
+        int error = errno; request.count = 0;
+        if (vav4l2_xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &request) < 0) return -1;
+        errno = error; return -1;
+    }
     ctx->capture_bufs_allocd = request.count; ctx->capture_memory = V4L2_MEMORY_MMAP;
     ctx->cap_width = p->width; ctx->cap_height = p->height; ctx->cap_stride = p->plane_fmt[0].bytesperline;
     if (!ctx->capture_layout) { ctx->cap_sizeimage = p->plane_fmt[0].sizeimage; ctx->cap_pixelformat = p->pixelformat; }
