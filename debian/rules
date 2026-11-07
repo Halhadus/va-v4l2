@@ -12,6 +12,9 @@ override_dh_auto_install:
 override_dh_auto_configure:
 	dh_auto_configure -- -Dtests=true -Dhardware_tests=auto -Db_ndebug=false
 
+override_dh_gencontrol:
+	libva_version="$$(pkg-config --variable=libva_version libva)"; test -n "$$libva_version" && dpkg --validate-version "$$libva_version" && dh_gencontrol -- -Vlibva:Depends="libva2 (>= $$libva_version)"
+
 override_dh_compress:
 	dh_compress -X.md -XCOPYING -XAUTHORS
 

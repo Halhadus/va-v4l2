@@ -8,21 +8,28 @@ concurrency:
 jobs:
   unit:
     name: Unit (${{ matrix.mode }})
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    env:
+      CC: ${{ matrix.compiler }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        mode: [normal, sanitizers]
+        include:
+          - {mode: normal, compiler: gcc, runner: ubuntu-24.04}
+          - {mode: sanitizers, compiler: gcc, runner: ubuntu-24.04}
+          - {mode: clang, compiler: clang, runner: ubuntu-24.04}
+          - {mode: aarch64, compiler: gcc, runner: ubuntu-24.04-arm}
+          - {mode: libva-2.24.1, compiler: gcc, runner: ubuntu-24.04, libva: 2.24.1}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential meson ninja-build pkg-config libdrm-dev libgbm-dev libegl-dev libgles-dev ffmpeg
-      - name: libva 2.23.0
+        run: sudo apt-get update && sudo apt-get install -y build-essential meson ninja-build pkg-config libdrm-dev libgbm-dev libegl-dev libgles-dev ffmpeg ${{ matrix.compiler == 'clang' && 'clang libclang-rt-dev' || '' }}
+      - name: libva ${{ matrix.libva || '2.23.0' }}
         run: |
-          git clone --depth 1 --branch 2.23.0 https://github.com/intel/libva.git "$RUNNER_TEMP/libva"
+          git clone --depth 1 --branch ${{ matrix.libva || '2.23.0' }} https://github.com/intel/libva.git "$RUNNER_TEMP/libva"
           meson setup "$RUNNER_TEMP/libva-build" "$RUNNER_TEMP/libva" --prefix="$RUNNER_TEMP/va" --libdir=lib -Dwith_x11=no -Dwith_glx=no -Dwith_wayland=no -Dwith_win32=no
           meson compile -C "$RUNNER_TEMP/libva-build"
           meson install -C "$RUNNER_TEMP/libva-build"
@@ -32,7 +39,9 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: python3 tools/test.py --suite unit ${{ matrix.mode == 'sanitizers' && '--sanitize' || '' }}
+        run: |
+          meson setup build -Dwerror=true -Db_lto=${{ matrix.compiler == 'gcc' && matrix.mode != 'sanitizers' }} -Dfuzzing=${{ matrix.compiler == 'clang' }}
+          python3 tools/test.py --suite unit ${{ matrix.mode == 'sanitizers' && '--sanitize' || '' }}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -67,6 +76,35 @@ jobs:
           path: verify/libva-v4l2-run-*.tar.gz
           if-no-files-found: error
           retention-days: 30
+  binary:
+    name: Debian binary package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build, install, reinstall, remove and purge
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src debian:sid sh -ec '
+            export DEBIAN_FRONTEND=noninteractive DEB_BUILD_OPTIONS=parallel=2
+            apt-get update
+            apt-get install -y build-essential debhelper meson ninja-build pkg-config libva-dev libdrm-dev libgbm-dev libegl-dev libgles-dev linux-libc-dev python3 ffmpeg
+            dpkg-buildpackage -us -uc -b
+            set -- ../libva-v4l2_*.deb
+            test "$#" -eq 1
+            package=$1
+            test -f "$package"
+            dpkg-deb -f "$package" Depends
+            apt-get install -y "$package"
+            driver=/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/dri/v4l2_drv_video.so
+            test -f "$driver"
+            nm -D --defined-only "$driver"
+            dpkg -i "$package"
+            dpkg --remove libva-v4l2
+            test ! -e "$driver"
+            dpkg --purge libva-v4l2
+          '
   source:
     name: Source package
     runs-on: ubuntu-24.04
