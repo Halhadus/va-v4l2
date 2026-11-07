@@ -2,7 +2,7 @@ Source: libva-v4l2
 Section: video
 Priority: optional
 Maintainer: Halhadus <eneshakans45@proton.me>
-Build-Depends: debhelper-compat (= 13), meson (>= 0.63), ninja-build, pkg-config, libva-dev (>= 2.23.0), libdrm-dev, libgbm-dev, libegl-dev, libgles-dev, linux-libc-dev (>= 6.8), python3
+Build-Depends: debhelper-compat (= 13), meson (>= 0.63), ninja-build, pkg-config, libva-dev (>= 2.23.0), libdrm-dev, libgbm-dev, libegl-dev, libgles-dev, linux-libc-dev (>= 6.8), python3, git <!nocheck>
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 Homepage: https://github.com/Halhadus/va-v4l2

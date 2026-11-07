@@ -89,7 +89,7 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src debian:sid sh -ec '
             export DEBIAN_FRONTEND=noninteractive DEB_BUILD_OPTIONS=parallel=2
             apt-get update
-            apt-get install -y build-essential debhelper meson ninja-build pkg-config libva-dev libdrm-dev libgbm-dev libegl-dev libgles-dev linux-libc-dev python3 ffmpeg
+            apt-get install -y build-essential debhelper meson ninja-build pkg-config libva-dev libdrm-dev libgbm-dev libegl-dev libgles-dev linux-libc-dev python3 git ffmpeg
             dpkg-buildpackage -us -uc -b
             set -- ../libva-v4l2_*.deb
             test "$#" -eq 1
