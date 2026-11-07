@@ -16,12 +16,12 @@ static void h264_contract(struct vav4l2_context *ctx)
     VAPictureParameterBufferH264 pic = {0}; uint8_t payload[] = {0, 0, 1, 0x65, 0x80};
     pic.seq_fields.bits.frame_mbs_only_flag = 1;
     for (unsigned i = 0; i < 16; i++) pic.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
-    struct vav4l2_buffer picture = {.type = VAPictureParameterBufferType, .data = &pic},
+    struct vav4l2_buffer picture = {.type = VAPictureParameterBufferType, .data = &pic, .size = sizeof(pic)},
         data = {.type = VASliceDataBufferType, .data = payload, .size = sizeof(payload)};
     struct vav4l2_buffer *buffers[] = {&picture, &data};
     pic.seq_fields.bits.pic_order_cnt_type = 1; ioctls = 0;
-    expect(vav4l2_h264_translate(ctx, buffers, 2) == VA_STATUS_ERROR_UNIMPLEMENTED && !ioctls,
-        "poc1-without-original-sps-offsets-never-submits-zero-invented-cycle");
+    expect(vav4l2_h264_translate(ctx, buffers, 2) == VA_STATUS_ERROR_INVALID_PARAMETER && !ioctls,
+        "poc1-without-slice-metadata-cannot-normalize");
     pic.seq_fields.bits.pic_order_cnt_type = 0; pic.seq_fields.bits.frame_mbs_only_flag = 0;
     pic.picture_height_in_mbs_minus1 = 1; pic.pic_fields.bits.field_pic_flag = 1;
     for (unsigned bottom = 0; bottom < 2; bottom++) {
@@ -43,7 +43,7 @@ static void hevc_contract(struct vav4l2_context *ctx)
 {
     VAPictureParameterBufferHEVC pic = {0}; uint8_t payload[] = {0, 0, 1, 0x26, 1, 0x80};
     for (unsigned i = 0; i < 15; i++) pic.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
-    struct vav4l2_buffer picture = {.type = VAPictureParameterBufferType, .data = &pic},
+    struct vav4l2_buffer picture = {.type = VAPictureParameterBufferType, .data = &pic, .size = sizeof(pic)},
         data = {.type = VASliceDataBufferType, .data = payload, .size = sizeof(payload)};
     struct vav4l2_buffer *buffers[] = {&picture, &data};
     pic.st_rps_bits = UINT16_MAX + 1u; ioctls = 0;
@@ -95,7 +95,7 @@ static VAStatus submit(struct vav4l2_context *ctx, VASurfaceID ref, unsigned cod
     VASliceParameterBufferBase base = {.slice_data_size = sizeof(payload)};
     memcpy(&slice, &base, sizeof(base));
     unsigned index = codec < 4 ? codec : 1;
-    struct vav4l2_buffer picture = {.type = VAPictureParameterBufferType, .data = params[index]},
+    struct vav4l2_buffer picture = {.type = VAPictureParameterBufferType, .data = params[index], .size = index == 0 ? sizeof(h264) : sizeof(hevc)},
         data = {.type = VASliceDataBufferType, .data = payload, .size = sizeof(payload)};
     struct vav4l2_buffer parameter = {.type = VASliceParameterBufferType, .data = &slice, .size = sizeof(slice)};
     struct vav4l2_buffer *buffers[] = {&picture, &parameter, &data};

@@ -152,7 +152,7 @@ static void translate(enum vav4l2_codec codec)
     h264.seq_fields.bits.frame_mbs_only_flag = 1;
     h264.pic_fields.bits.reference_pic_flag = 1;
     struct vav4l2_buffer picture = {.type = VAPictureParameterBufferType,
-        .data = codec == VAV4L2_CODEC_H264 ? (void *)&h264 : (void *)&hevc};
+        .data = codec == VAV4L2_CODEC_H264 ? (void *)&h264 : (void *)&hevc, .size = codec == VAV4L2_CODEC_H264 ? sizeof(h264) : sizeof(hevc)};
     union slice_param p; set_param(&p, 1, 4, 0);
     if (codec == VAV4L2_CODEC_H264) p.h264.slice_type = 2;
     struct vav4l2_buffer pb = params(&p, 1), db = data(codec == VAV4L2_CODEC_HEVC ? hevc_payload : payload, codec == VAV4L2_CODEC_HEVC ? sizeof(hevc_payload) : sizeof(payload));

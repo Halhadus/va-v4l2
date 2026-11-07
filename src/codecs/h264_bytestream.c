@@ -160,3 +160,59 @@ VAStatus vav4l2_h264_rewrite(const struct vav4l2_collected *cb, struct vav4l2_bu
     if (status == VA_STATUS_SUCCESS && vav4l2_annexb_next(data, bytes, &cursor, &unit, &length) != 0) status = VA_STATUS_ERROR_INVALID_PARAMETER;
     free(scratch); return status;
 }
+
+void vav4l2_h264_poc1_release(struct vav4l2_h264_normalized *p)
+{
+    free(p->slices); free(p->data); memset(p, 0, sizeof(*p));
+}
+/* The Request backend consumes the same normalized slice syntax as the
+ * bytestream backend. Only SPS/PPS NAL units are removed; entropy data stays. */
+VAStatus vav4l2_h264_poc1_prepare(struct vav4l2_context *ctx, struct vav4l2_buffer **buffers, int count,
+    struct vav4l2_h264_normalized *out)
+{
+    if (!ctx || !out || !vav4l2_packet_buffers_valid(VAV4L2_CODEC_H264, buffers, count)) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    struct vav4l2_collected cb; vav4l2_collect_decode_buffers(buffers, count, &cb);
+    const VAPictureParameterBufferH264 *pic = cb.pic;
+    if (!pic || pic->seq_fields.bits.pic_order_cnt_type != 1) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    size_t raw = 0;
+    VAStatus status = vav4l2_packetize_slices(VAV4L2_CODEC_H264, buffers, count, NULL, UINT32_MAX, &raw);
+    if (status != VA_STATUS_SUCCESS) return status;
+    if (raw > (UINT32_MAX - 16384u) / 2) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    size_t capacity = raw * 2 + 16384, bytes = 0;
+    struct vav4l2_h264_normalized p = {0};
+    p.data = malloc(capacity); if (!p.data) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    status = vav4l2_stateful_packet_prepare(ctx, buffers, count, p.data, capacity, &bytes, &p.prepared, NULL);
+    size_t cursor = 0, length; const uint8_t *unit = NULL, *payload = NULL;
+    for (unsigned i = 0; status == VA_STATUS_SUCCESS && i < 2; i++)
+        if (vav4l2_annexb_next(p.data, bytes, &cursor, &unit, &length) != 1 || (unit[unit[2] == 1 ? 3 : 4] & 31) != 7 + i)
+            status = VA_STATUS_ERROR_INVALID_PARAMETER;
+    unsigned slices = 0;
+    for (int i = 0; i < count && status == VA_STATUS_SUCCESS; i++) {
+        const struct vav4l2_buffer *b = buffers[i];
+        if (b->type != VASliceParameterBufferType) continue;
+        unsigned n = b->num_elements ? b->num_elements : 1;
+        for (unsigned j = 0; j < n; j++) {
+            VASliceParameterBufferH264 slice; memcpy(&slice, (const uint8_t *)b->data + (size_t)j * b->size, sizeof(slice));
+            if (slice.slice_data_flag != VA_SLICE_DATA_FLAG_ALL && slice.slice_data_flag != VA_SLICE_DATA_FLAG_BEGIN) continue;
+            if (slices == 65536 || vav4l2_annexb_next(p.data, bytes, &cursor, &unit, &length) != 1) { status = VA_STATUS_ERROR_INVALID_PARAMETER; break; }
+            VASliceParameterBufferH264 *grown = realloc(p.slices, (slices + 1u) * sizeof(*grown));
+            if (!grown) { status = VA_STATUS_ERROR_ALLOCATION_FAILED; break; }
+            p.slices = grown; if (!payload) payload = unit;
+            slice.slice_data_offset = unit - payload; slice.slice_data_size = length; slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+            /* Request parsers derive header offsets from the rewritten RBSP. */
+            slice.slice_data_bit_offset = 0; p.slices[slices++] = slice;
+        }
+    }
+    if (status == VA_STATUS_SUCCESS && (!slices || vav4l2_annexb_next(p.data, bytes, &cursor, &unit, &length) != 0)) status = VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (status != VA_STATUS_SUCCESS) { vav4l2_h264_poc1_release(&p); return status; }
+    p.pic = *pic; p.pic.seq_fields.bits.pic_order_cnt_type = 0; p.pic.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = 12;
+    p.pic.seq_fields.bits.delta_pic_order_always_zero_flag = 0; p.pic.pic_fields.bits.pic_order_present_flag = 1;
+    p.buffers[0] = (struct vav4l2_buffer){.type = VAPictureParameterBufferType, .size = sizeof(p.pic), .num_elements = 1};
+    p.buffers[1] = (struct vav4l2_buffer){.type = VASliceParameterBufferType, .data = p.slices, .size = sizeof(*p.slices), .num_elements = slices, .allocated_elements = slices};
+    p.buffers[2] = (struct vav4l2_buffer){.type = VASliceDataBufferType, .data = (void *)payload, .size = bytes - (payload - p.data), .num_elements = 1};
+    p.count = 3;
+    if (cb.iq) p.buffers[p.count++] = (struct vav4l2_buffer){.type = VAIQMatrixBufferType, .data = cb.iq, .size = sizeof(VAIQMatrixBufferH264), .num_elements = 1};
+    *out = p; out->buffers[0].data = &out->pic;
+    for (unsigned i = 0; i < out->count; i++) out->batch[i] = &out->buffers[i];
+    return VA_STATUS_SUCCESS;
+}

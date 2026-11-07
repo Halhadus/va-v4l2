@@ -9,6 +9,7 @@
 #include "va_v4l2.h"
 #include "codecs/vp9_request.h"
 #include "codecs/request_slices.h"
+#include "codecs/bytestream.h"
 int drmGetNodeTypeFromFd(int fd) { (void)fd; return 2; }
 /* The shim supplies reference availability for parser checks; it has no
  * kernel CAPTURE allocations. Queue/storage ownership is tested separately. */
@@ -44,7 +45,15 @@ static VAStatus end(VADriverContextP d, VAContextID id)
     uint8_t *data = malloc(8 * 1024 * 1024); size_t bytes = 0;
     struct vav4l2_packet_state prepared = {0};
     struct vav4l2_packet_layout layout;
-    VAStatus status = vav4l2_stateful_packet_prepare(c, c->pending_buffers, c->num_pending_buffers, data, 8 * 1024 * 1024, &bytes, &prepared, &layout);
+    struct vav4l2_h264_normalized normalized = {0};
+    struct vav4l2_buffer **submitted = c->pending_buffers; int submitted_count = c->num_pending_buffers;
+    VAStatus status = VA_STATUS_SUCCESS;
+    if (c->codec == VAV4L2_CODEC_H264 && getenv("VAV4L2_REQUEST_POC1_ORACLE")) {
+        status = vav4l2_h264_poc1_prepare(c, submitted, submitted_count, &normalized);
+        if (!status) { submitted = normalized.batch; submitted_count = normalized.count; }
+    }
+    if (!status) status = vav4l2_stateful_packet_prepare(c, submitted, submitted_count, data, 8 * 1024 * 1024, &bytes, &prepared, &layout);
+    if (!status && normalized.count) prepared = normalized.prepared;
     struct vav4l2_vp9_state vp9_pending = c->vp9_state ? *c->vp9_state : (struct vav4l2_vp9_state){0};
     if (!status && c->codec == VAV4L2_CODEC_VP9) {
         struct vav4l2_collected cb; vav4l2_collect_decode_buffers(c->pending_buffers, c->num_pending_buffers, &cb);
@@ -60,19 +69,19 @@ static VAStatus end(VADriverContextP d, VAContextID id)
         if (!status && !c->vp9_state) status = VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
     if (!status && (c->codec == VAV4L2_CODEC_H264 || c->codec == VAV4L2_CODEC_HEVC)) {
-        struct vav4l2_collected cb; vav4l2_collect_decode_buffers(c->pending_buffers, c->num_pending_buffers, &cb);
+        struct vav4l2_collected cb; vav4l2_collect_decode_buffers(submitted, submitted_count, &cb);
         uint8_t *raw = malloc(8 * 1024 * 1024); size_t raw_size = 0;
         struct v4l2_ctrl_h264_decode_params h264;
         struct v4l2_ctrl_hevc_decode_params hevc;
         if (!raw) status = VA_STATUS_ERROR_ALLOCATION_FAILED;
         else {
-            status = vav4l2_packetize_slices(c->codec, c->pending_buffers, c->num_pending_buffers, raw, 8 * 1024 * 1024, &raw_size);
+            status = vav4l2_packetize_slices(c->codec, submitted, submitted_count, raw, 8 * 1024 * 1024, &raw_size);
             if (!status) {
                 if (c->codec == VAV4L2_CODEC_H264) h264_fill_decode_params(&h264, cb.pic, c->driver_data, cb.slice_params[0]);
                 else vav4l2_hevc_fill_decode_params(&hevc, cb.pic, c->driver_data);
                 struct vav4l2_slice_plan *plan = NULL;
                 vav4l2_set_ioctl_hook(parser_query);
-                status = vav4l2_request_slice_plan(c, c->pending_buffers, c->num_pending_buffers, raw, raw_size, cb.pic,
+                status = vav4l2_request_slice_plan(c, submitted, submitted_count, raw, raw_size, cb.pic,
                     c->codec == VAV4L2_CODEC_H264 ? (void *)&h264 : (void *)&hevc, &plan);
                 vav4l2_request_slice_free(plan); vav4l2_set_ioctl_hook(NULL);
             }
@@ -109,7 +118,7 @@ static VAStatus end(VADriverContextP d, VAContextID id)
     if (!status) { vav4l2_packet_state_commit(c, &prepared); if (c->vp9_state) *c->vp9_state = vp9_pending; }
     else if (prepared.av1 != c->packet_state.av1) vav4l2_packet_state_release(&prepared);
     fprintf(stderr,"packet-oracle: codec=%u status=%u bytes=%zu\n",c->codec,status,bytes);
-    free(data); c->current_surface->status = status ? VASurfaceSkipped : VASurfaceReady; c->current_surface = NULL; c->num_pending_buffers = 0; return status;
+    vav4l2_h264_poc1_release(&normalized); free(data); c->current_surface->status = status ? VASurfaceSkipped : VASurfaceReady; c->current_surface = NULL; c->num_pending_buffers = 0; return status;
 }
 VAStatus vaInitialize(VADisplay display, int *major, int *minor)
 {

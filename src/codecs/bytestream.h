@@ -62,6 +62,16 @@ static inline int vav4l2_packet_buffers_valid(enum vav4l2_codec codec, struct va
     }
     return 1;
 }
+struct vav4l2_h264_normalized {
+    VAPictureParameterBufferH264 pic;
+    VASliceParameterBufferH264 *slices;
+    uint8_t *data;
+    struct vav4l2_buffer buffers[4], *batch[4];
+    struct vav4l2_packet_state prepared;
+    unsigned count;
+};
+VAStatus vav4l2_h264_poc1_prepare(struct vav4l2_context *, struct vav4l2_buffer **, int, struct vav4l2_h264_normalized *);
+void vav4l2_h264_poc1_release(struct vav4l2_h264_normalized *);
 VAStatus vav4l2_h264_headers(struct vav4l2_context *, const struct vav4l2_collected *, struct vav4l2_buffer **, int, const uint8_t *, size_t, uint8_t *, size_t, size_t *, struct vav4l2_packet_state *);
 VAStatus vav4l2_hevc_headers(struct vav4l2_context *, const struct vav4l2_collected *, const uint8_t *, size_t, uint8_t *, size_t, size_t *, int);
 VAStatus vav4l2_h264_rewrite(const struct vav4l2_collected *, struct vav4l2_buffer **, int, const uint8_t *, size_t, uint8_t *, size_t, size_t *);

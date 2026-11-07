@@ -110,6 +110,7 @@ if get_option('tests')
     'export_recapture': ['vav4l2_open_device', 'vav4l2_open_media_for_device', 'vav4l2_gbm_surface_ensure_export'],
     'format': [],
     'gbm_coherence': ['gbm_create_device', 'gbm_device_destroy', 'gbm_bo_create', 'gbm_bo_import', 'gbm_bo_map', 'gbm_bo_unmap', 'gbm_bo_get_stride_for_plane', 'gbm_bo_get_modifier', 'gbm_bo_get_fd_for_plane', 'gbm_bo_destroy', 'mmap', 'mmap64', 'vav4l2_alloc_shared_storage', 'vav4l2_alloc_coherent_storage', 'vav4l2_alloc_drm_storage'],
+    'h264_poc1': ['vav4l2_decode_submit', 'vav4l2_decode_submit_field', 'vav4l2_ensure_capture', 'vav4l2_surface_pull_capture'],
     'h264_fields': ['vav4l2_decode_submit', 'vav4l2_decode_submit_field', 'vav4l2_ensure_capture', 'vav4l2_surface_pull_capture'],
     'hevc_submission': [],
     'image_coherence': ['vav4l2_gbm_surface_sync'],

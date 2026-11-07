@@ -28,6 +28,7 @@
 #include <linux/videodev2.h>
 
 #include "va_v4l2.h"
+#include "bytestream.h"
 #include "request_slices.h"
 
 /* Convert VA-API SPS fields to V4L2 SPS flags */
@@ -694,7 +695,7 @@ static VAStatus h264_submit_picture(struct vav4l2_context *ctx, const VAPictureP
  *
  * This is the critical path: if this function works, H.264 decoding works.
  */
-VAStatus vav4l2_h264_translate(struct vav4l2_context *ctx,
+static VAStatus h264_translate(struct vav4l2_context *ctx,
                                struct vav4l2_buffer **buffers,
                                int num_buffers)
 {
@@ -736,11 +737,6 @@ VAStatus vav4l2_h264_translate(struct vav4l2_context *ctx,
         (!pic_param->seq_fields.bits.frame_mbs_only_flag && ((pic_param->picture_height_in_mbs_minus1 + 1) & 1)) ||
         (pic_param->seq_fields.bits.frame_mbs_only_flag && pic_param->pic_fields.bits.field_pic_flag))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    /* Standard VA decode buffers omit the POC1 SPS cycle offsets. */
-    if (pic_param->seq_fields.bits.pic_order_cnt_type == 1) {
-        fprintf(stderr, "v4l2: H.264 POC1 requires original SPS cycle metadata\n");
-        return VA_STATUS_ERROR_UNIMPLEMENTED;
-    }
     if (pic_param->pic_fields.bits.field_pic_flag && !ctx->current_surface) return VA_STATUS_ERROR_INVALID_SURFACE;
     if (pic_param->pic_fields.bits.field_pic_flag && !vav4l2_h264_field_supported(ctx)) return VA_STATUS_ERROR_UNIMPLEMENTED;
     if (!pic_param->pic_fields.bits.field_pic_flag && ctx->h264_field) vav4l2_h264_discard_field(ctx, 0);
@@ -1013,3 +1009,21 @@ static VAStatus h264_submit_picture(struct vav4l2_context *ctx, const VAPictureP
 }
 
 const int vav4l2_has_h264 = 1;
+
+VAStatus vav4l2_h264_translate(struct vav4l2_context *ctx, struct vav4l2_buffer **buffers, int count)
+{
+    if (!ctx || !vav4l2_packet_buffers_valid(VAV4L2_CODEC_H264, buffers, count)) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    struct vav4l2_collected cb; vav4l2_collect_decode_buffers(buffers, count, &cb);
+    const VAPictureParameterBufferH264 *pic = cb.pic;
+    if (!pic || pic->seq_fields.bits.pic_order_cnt_type != 1) {
+        VAStatus status = h264_translate(ctx, buffers, count);
+        if (status == VA_STATUS_SUCCESS && pic && pic->pic_fields.bits.reference_pic_flag) ctx->packet_state.h264_valid = 0;
+        return status;
+    }
+    if (!cb.n_slice_params) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    struct vav4l2_h264_normalized normalized = {0};
+    VAStatus status = vav4l2_h264_poc1_prepare(ctx, buffers, count, &normalized);
+    if (status == VA_STATUS_SUCCESS) status = h264_translate(ctx, normalized.batch, normalized.count);
+    if (status == VA_STATUS_SUCCESS) vav4l2_packet_state_commit(ctx, &normalized.prepared);
+    vav4l2_h264_poc1_release(&normalized); return status;
+}

@@ -36,6 +36,8 @@ def main():
               ('h264-poc1-cabac', 'h264', ['-profile:v', 'main', '-x264-params', 'threads=1:bframes=0:slices=4']),
               ('hevc-main10', 'hevc', ['-pix_fmt', 'yuv420p10le', '-x265-params', 'pools=none:frame-threads=1:log-level=error']),
               ('hevc-temporal', 'hevc', ['-x265-params', 'pools=none:frame-threads=1:log-level=error:temporal-layers=1'])]
+    cases += [('h264-request-poc1-cavlc', 'h264', ['-profile:v', 'baseline', '-x264-params', 'threads=1:bframes=0:slices=4']),
+              ('h264-request-poc1-cabac', 'h264', ['-profile:v', 'main', '-x264-params', 'threads=1:bframes=0:slices=4'])]
     cases += [('hevc-multiple-slices', 'hevc', ['-x265-params', f'pools={x265_pool()}:frame-threads=1:log-level=error:slices=2'])]
     if 'libvpx-vp9' in encoders:
         cases += [('vp9-profile0', 'vp9', ['-deadline', 'realtime', '-cpu-used', '8', '-lag-in-frames', '0']),
@@ -55,12 +57,13 @@ def main():
                  'libx264' if codec == 'h264' else 'libvpx-vp9' if codec == 'vp9' else 'libaom-av1' if codec == 'av1' else 'libx265', *options,
                  *(['-f', 'ivf'] if codec == 'vp9' else ['-f', 'obu'] if codec == 'av1' else []), '-y', str(source)])
             if name.startswith('vp9-hidden'): hide_key_frames(source)
-            if name.startswith('h264-poc1'): rewrite_poc_type1(source)
+            if 'poc1' in name: rewrite_poc_type1(source)
             if name.endswith('pps15'): rewrite_pps_id(source, 15)
             preload = str(shim)
             # A sanitizer-instrumented shim must load its runtime before libva/FFmpeg.
             if os.environ.get('VAV4L2_ORACLE_ASAN'): preload = os.environ['VAV4L2_ORACLE_ASAN'] + ':' + preload
             env = dict(os.environ, LD_PRELOAD=preload, LIBVA_DRIVER_NAME='v4l2', LIBVA_DRIVERS_PATH=str(build), VAV4L2_PACKET_ORACLE_OUT=str(reconstructed), VAV4L2_ADVERTISE_AV1='1')
+            if name.startswith('h264-request-poc1'): env['VAV4L2_REQUEST_POC1_ORACLE'] = '1'
             run([ffmpeg, '-v', 'error', '-hwaccel', 'vaapi', '-hwaccel_device', '/dev/null', '-hwaccel_output_format', 'vaapi', '-i', str(source), '-f', 'null', '-'], env)
             if codec == 'vp9':
                 data = reconstructed.read_bytes(); cursor = 32; packets = 0
