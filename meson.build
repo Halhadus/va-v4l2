@@ -165,6 +165,16 @@ if get_option('tests')
       test('hevc_metadata_dispatch', exe, args: ['--adapter'], suite: 'unit', env: ['LD_PRELOAD=' + preload, 'VAV4L2_HEVC_PACKET_MODE=whole', 'VAV4L2_HEVC_PACKET_LOG=' + meson.current_build_dir() / 'hevc-metadata-dispatch.tsv'])
     endif
   endforeach
+  fuzz_seeds = executable('packet_fuzz_seeds', 'tests/fuzz_packets.c', c_args: ['-DVAV4L2_FUZZ_SEEDS'] + test_no_lto, link_args: ['-Wl,--wrap=vav4l2_scan_all_cached'], link_with: test_core, include_directories: inc, dependencies: core_deps)
+  test('packet_fuzz_seeds', fuzz_seeds, suite: 'unit')
+  if get_option('fuzzing')
+    if cc.get_id() != 'clang'
+      error('fuzzing=true requires Clang with libFuzzer')
+    endif
+    fuzz_core = static_library('va_v4l2_fuzz_core', core_sources, c_args: ['-fsanitize=fuzzer-no-link,address,undefined'], override_options: ['b_lto=false'], include_directories: inc, dependencies: core_deps)
+    fuzz_packets = executable('fuzz_packets', 'tests/fuzz_packets.c', link_with: fuzz_core, c_args: ['-fsanitize=fuzzer,address,undefined'], link_args: ['-fsanitize=fuzzer,address,undefined', '-Wl,--wrap=vav4l2_scan_all_cached'], override_options: ['b_lto=false'], include_directories: inc, dependencies: core_deps)
+    test('packet_fuzz', fuzz_packets, args: ['-runs=2000', '-max_len=4096', '-seed=1470746883'], suite: 'unit', timeout: 120)
+  endif
   test('capture_trace', python, args: files('tests/test_capture_trace.py'), suite: 'unit', timeout: 120)
   test('collect_capabilities', python, args: files('tests/test_collect_capabilities.py'), suite: 'unit', timeout: 120)
   test('compare_framemd5', python, args: files('tests/test_compare_framemd5.py'), suite: 'unit', timeout: 120)

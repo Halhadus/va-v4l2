@@ -217,8 +217,9 @@ static void import_checks(void)
     if (sid == VA_INVALID_ID) { va.vaTerminate(&driver); close(client); close(owner); vav4l2_set_ioctl_hook(NULL); return; }
     struct vav4l2_surface *s = dd->surfaces[sid]; int held = s->import_fd;
     expect(s->gbm_imported && held != client && (fcntl(held, F_GETFD) & FD_CLOEXEC) && !fcntl(client, F_GETFD), "import-does-not-close-or-change-client-fd-flags");
-    VAImage image; VAImageFormat fmt = {.fourcc = VA_FOURCC_NV12}; void *pixels;
+    VAImage image; VAImageFormat fmt = {.fourcc = VA_FOURCC_NV12}; void *pixels = NULL;
     expect(va.vaCreateImage(&driver, &fmt, 4, 4, &image) == VA_STATUS_SUCCESS && va.vaMapBuffer(&driver, image.buf, &pixels) == VA_STATUS_SUCCESS, "import-readback-image");
+    if (!pixels) { va.vaTerminate(&driver); close(client); close(owner); vav4l2_set_ioctl_hook(NULL); return; }
     expect(va.vaGetImage(&driver, sid, 0, 0, 4, 4, image.image_id) == VA_STATUS_SUCCESS && image_matches(&image, pixels, data), "import-independent-y-uv-byte-oracle");
     pattern(data, 2); expect(pwrite(owner, data, sizeof(data), 0) == (ssize_t)sizeof(data), "external-writer-updates-object");
     sync_eagain = sync_eintr = 1;
