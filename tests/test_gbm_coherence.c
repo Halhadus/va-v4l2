@@ -121,6 +121,7 @@ void __wrap_gbm_bo_destroy(struct gbm_bo *handle)
 }
 static int sync_active, sync_start_fail, sync_end_fail, sync_eagain, sync_eintr, sync_reads, sync_writes, foreign_queue;
 static struct vav4l2_m2m_state *import_queue;
+static int native_export_fd = -1, native_exports;
 static int import_ioctl(int fd, unsigned long request, void *argument)
 {
     expect(fcntl(fd, F_GETFD) >= 0, "import-keeps-a-live-fd");
@@ -140,7 +141,10 @@ static int import_ioctl(int fd, unsigned long request, void *argument)
         return 0;
     }
     expect(!sync_active, "v4l2-queue-is-outside-dma-buf-cpu-access");
-    if (request == VIDIOC_EXPBUF) { foreign_queue++; errno = EINVAL; return -1; }
+    if (request == VIDIOC_EXPBUF) {
+        if (native_export_fd >= 0) { native_exports++; ((struct v4l2_exportbuffer *)argument)->fd = fcntl(native_export_fd, F_DUPFD_CLOEXEC, 0); return 0; }
+        foreign_queue++; errno = EINVAL; return -1;
+    }
     if (import_queue && request == VIDIOC_QBUF && ((struct v4l2_buffer *)argument)->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
         memcpy(import_queue->cap_map, import_queue->out_map[0], 24);
     if (request == VIDIOC_DQBUF) ((struct v4l2_buffer *)argument)->m.planes[0].bytesused = 24;
@@ -357,6 +361,61 @@ static void import_checks(void)
     }
     if (padded_fd >= 0) close(padded_fd);
     va.vaTerminate(&driver); close(owner); if (exported_desc.objects[0].fd >= 0) close(exported_desc.objects[0].fd); vav4l2_set_ioctl_hook(NULL);
+}
+static void av1_export_lifetime(void)
+{
+    struct VADriverVTable va = {0}; struct VADriverContext driver = {.vtable = &va};
+    if (VAV4L2_DRIVER_INIT(&driver)) { expect(0, "av1-export-init"); return; }
+    struct vav4l2_driver_data *dd = driver.pDriverData;
+    vav4l2_set_ioctl_hook(import_ioctl);
+    for (unsigned ten = 0; ten < 2; ten++) {
+        VASurfaceAttrib attr = {.type = VASurfaceAttribPixelFormat,
+            .value = {.type = VAGenericValueTypeInteger, .value.i = ten ? VA_FOURCC_P010 : VA_FOURCC_NV12}};
+        VASurfaceID ids[2]; unsigned size = ten ? 48 : 24;
+        if (va.vaCreateSurfaces2(&driver, ten ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420, 4, 4, ids, 2, &attr, 1)) {
+            expect(0, "av1-export-surfaces"); break;
+        }
+        native_export_fd = memfd_create("av1-recycled-capture", MFD_CLOEXEC);
+        if (native_export_fd < 0 || ftruncate(native_export_fd, size)) { expect(0, "av1-export-capture"); break; }
+        unsigned char *capture = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, native_export_fd, 0);
+        if (capture == MAP_FAILED) { expect(0, "av1-export-map"); close(native_export_fd); native_export_fd = -1; break; }
+        struct vav4l2_context decode = {.driver_data = dd, .entrypoint = VAEntrypointVLD, .codec = VAV4L2_CODEC_AV1,
+            .v4l2_fd = device_fd, .capture_bufs_allocd = 1, .capture_buf_ptr = {capture}, .capture_buf_size = size,
+            .width = 4, .height = 4, .cap_width = 4, .cap_height = 4, .cap_stride = ten ? 8 : 4, .cap_sizeimage = size,
+            .cap_pixelformat = ten ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12, .render_targets = ids, .num_render_targets = 2};
+        dd->contexts = &decode; native_exports = 0;
+        for (unsigned late = 0; late < 2; late++) {
+            struct vav4l2_surface *s = dd->surfaces[ids[late]];
+            VADRMPRIMESurfaceDescriptor first = {0}, again = {0}; unsigned char pixel = 0;
+            memset(capture, 0x3c, size);
+            expect(!vav4l2_surface_pull_capture(&decode, s, 0), "av1-export-snapshots-decoded-frame");
+            if (!late) expect(va.vaExportSurfaceHandle(&driver, ids[late], VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                VA_EXPORT_SURFACE_READ_ONLY, &first) == VA_STATUS_SUCCESS, "av1-export-while-native-reference-is-live");
+            /* A retired DPB slot returns CAPTURE while the VA picture remains live. */
+            s->buf_index = -1; s->cap_view = NULL; decode.n_free_cap = 1; decode.free_cap_bufs[0] = 0;
+            memset(capture, 0xa7, size);
+            expect(va.vaExportSurfaceHandle(&driver, ids[late], VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                VA_EXPORT_SURFACE_READ_ONLY, &again) == VA_STATUS_SUCCESS && pread(again.objects[0].fd, &pixel, 1, 0) == 1 && pixel == 0x3c,
+                "av1-late-export-reads-snapshot-after-capture-reuse");
+            if (!late) {
+                struct stat a, b;
+                expect(pread(first.objects[0].fd, &pixel, 1, 0) == 1 && pixel == 0x3c &&
+                    !fstat(first.objects[0].fd, &a) && !fstat(again.objects[0].fd, &b) && a.st_dev == b.st_dev && a.st_ino == b.st_ino,
+                    "av1-retained-export-keeps-pixels-and-object-identity-after-capture-reuse");
+                memset(capture, 0x5a, size);
+                expect(!vav4l2_surface_pull_capture(&decode, s, 0) && pread(first.objects[0].fd, &pixel, 1, 0) == 1 && pixel == 0x5a,
+                    "av1-redecode-updates-the-retained-surface-object");
+                close(first.objects[0].fd);
+            }
+            if (again.num_objects) close(again.objects[0].fd);
+            s->buf_index = -1; s->cap_view = NULL; s->capture_ctx = NULL;
+        }
+        expect(!native_exports, "av1-export-never-transfers-recyclable-native-capture");
+        dd->contexts = NULL; vav4l2_capture_exports_release(&decode);
+        munmap(capture, size); close(native_export_fd); native_export_fd = -1;
+        va.vaDestroySurfaces(&driver, ids, 2);
+    }
+    va.vaTerminate(&driver); vav4l2_set_ioctl_hook(NULL);
 }
 static void export_formats(void)
 {
@@ -725,6 +784,7 @@ int main(int argc, char **argv)
     import_checks();
     shared_allocator_checks();
     export_formats();
+    av1_export_lifetime();
     if (argc == 1) {
         pid_t child = fork(); int status = 0;
         if (child == 0) { execl(argv[0], argv[0], "--expbuf", (char *)NULL); _exit(127); }

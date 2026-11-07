@@ -2186,9 +2186,9 @@ vav4l2_export_surface_handle2(VADriverContextP ctx, VASurfaceID surface_id,
             vav4l2_expbuf_export_wanted(), (void *)c,
             c ? c->v4l2_fd : -1);
     fflush(stderr);
-    /* Stateful completion chooses CAPTURE by timestamp, not by VA target.
-     * Export persistent surface storage so retained imports see later frames. */
-    if (c && !c->stateful && vav4l2_capture_layout_exportable(c) && surf->format == VA_FOURCC_NV12 && !surf->gbm_imported && !surf->gbm_writable &&
+    /* Stateful completion selects CAPTURE by timestamp; AV1 releases it when
+     * its last DPB slot retires. Export persistent surface storage for both. */
+    if (c && !c->stateful && c->codec != VAV4L2_CODEC_AV1 && vav4l2_capture_layout_exportable(c) && surf->format == VA_FOURCC_NV12 && !surf->gbm_imported && !surf->gbm_writable &&
         !(flags & VA_EXPORT_SURFACE_WRITE_ONLY) && surf->last_writer != VAV4L2_WRITER_CPU && vav4l2_expbuf_export_wanted()) {
         if (surf->buf_index < 0 && vav4l2_claim_capture_for_export(c, surf) < 0) {
             pthread_mutex_unlock(&vav4l2_api_lock); return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -2198,7 +2198,7 @@ vav4l2_export_surface_handle2(VADriverContextP ctx, VASurfaceID surface_id,
     }
     if (!surf->gbm_imported && !surf->gbm_writable && !(flags & VA_EXPORT_SURFACE_WRITE_ONLY) &&
         (surf->format == VA_FOURCC_NV12 || (surf->format == VA_FOURCC_P010 && surf->cap_fourcc == V4L2_PIX_FMT_P010)) &&
-        vav4l2_expbuf_export_wanted() && c && !c->stateful && !c->capture_layout && c->v4l2_fd >= 0 &&
+        vav4l2_expbuf_export_wanted() && c && !c->stateful && c->codec != VAV4L2_CODEC_AV1 && !c->capture_layout && c->v4l2_fd >= 0 &&
         (!c->cap_pixelformat || c->cap_pixelformat == V4L2_PIX_FMT_NV12 || c->cap_pixelformat == V4L2_PIX_FMT_P010) &&
         surf->last_writer != VAV4L2_WRITER_CPU &&
         (!surf->cap_fourcc || surf->cap_fourcc == V4L2_PIX_FMT_NV12 || surf->cap_fourcc == V4L2_PIX_FMT_P010)) {
