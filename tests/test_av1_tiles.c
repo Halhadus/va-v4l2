@@ -11,6 +11,9 @@ static int submitted, pull_error, grain_missing, grain_sent, normalize_capture, 
 static struct v4l2_ctrl_av1_frame submitted_frame;
 static struct v4l2_ctrl_av1_film_grain submitted_grain;
 static void *capture_pixels;
+static unsigned multi_tiles, multi_bytes;
+static uint8_t multi_expected[4096];
+static struct v4l2_ctrl_av1_tile_group_entry multi_entries[V4L2_AV1_MAX_TILE_COUNT];
 static int replay_fixture, replay_fault, replayed, resets, request_allocs, expected_replay_byte, expected_replay_seed;
 static uint64_t cdf_ts[8], capture_ts[VAV4L2_MAX_CAPTURE_BUFS];
 static void expect(int ok, const char *tag);
@@ -45,7 +48,8 @@ int __wrap_vav4l2_ensure_capture(struct vav4l2_context *c, int w, int h, uint32_
 { (void)c; (void)w; (void)h; (void)f; return 0; }
 int __wrap_vav4l2_decode_submit(struct vav4l2_context *c, int i, uint32_t bytes, uint64_t timestamp)
 {
-    (void)bytes; submitted++;
+    if (multi_tiles) expect(bytes == multi_bytes && !memcmp(c->output_buf_ptr[i], multi_expected, bytes), "raw-multi-tile-entropy-and-size-fields");
+    submitted++;
     if (!replay_fixture) return 0;
     int capture = c->current_surface->buf_index;
     if (capture < 0) capture = c->free_cap_bufs[--c->n_free_cap];
@@ -192,6 +196,10 @@ static int controls(int fd, unsigned long request, void *arg)
     if (request == VIDIOC_S_EXT_CTRLS) {
         struct v4l2_ext_controls *batch = arg;
         for (unsigned i = 0; i < batch->count; i++) {
+            if (multi_tiles && batch->controls[i].id == V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY) {
+                expect(batch->controls[i].size == multi_tiles * sizeof(*multi_entries), "multi-tile-control-array-size");
+                memcpy(multi_entries, batch->controls[i].ptr, batch->controls[i].size);
+            }
             grain_sent += batch->controls[i].id == V4L2_CID_STATELESS_AV1_FILM_GRAIN;
             if (batch->controls[i].id == V4L2_CID_STATELESS_AV1_FILM_GRAIN) submitted_grain = *(struct v4l2_ctrl_av1_film_grain *)batch->controls[i].ptr;
             if (batch->controls[i].id == V4L2_CID_STATELESS_AV1_FRAME) {
@@ -201,6 +209,83 @@ static int controls(int fd, unsigned long request, void *arg)
         }
     }
     return 0;
+}
+static void raw_multi(void)
+{
+    struct vav4l2_driver_data *dd = calloc(1, sizeof(*dd)); expect(dd != NULL, "multi-tile-fixture"); if (!dd) return;
+    for (unsigned tiles = 2; tiles <= 4; tiles += 2) for (unsigned layout = 0; layout < 6; layout++) for (unsigned inter = 0; inter < 2; inter++) {
+        unsigned split = layout == 1, prefix = layout >= 2 ? layout - 1 : 0;
+        uint8_t data[32], output[64]; VASliceParameterBufferAV1 params[4]; unsigned total = 0, expected = 0;
+        VADecPictureParameterBufferAV1 p = picture(128, 128, 2, tiles / 2);
+        p.primary_ref_frame = inter ? 0 : 7; p.pic_info_fields.bits.show_frame = 1; p.pic_info_fields.bits.frame_type = inter;
+        p.seq_info_fields.fields.subsampling_x = p.seq_info_fields.fields.subsampling_y = 1;
+        struct vav4l2_buffer b[9] = {{.type = VAPictureParameterBufferType, .size = sizeof(p), .data = &p}}, *batch[9]; unsigned count = 1;
+        for (unsigned i = 0; i < tiles; i++) {
+            if (prefix && i + 1 < tiles) for (unsigned j = 0; j < prefix; j++) data[total++] = i >> (8 * j);
+            params[i] = (VASliceParameterBufferAV1){.slice_data_size = i + 1, .slice_data_offset = split ? 0 : total,
+                .slice_data_flag = VA_SLICE_DATA_FLAG_ALL, .tile_row = i / 2, .tile_column = i % 2};
+            for (unsigned j = 0; j <= i; j++) data[total + j] = 0x80 + total + j;
+            if (i && i + 1 < tiles) for (unsigned j = 0; j < (prefix ? prefix : 4); j++) multi_expected[expected++] = i >> (8 * j);
+            memcpy(multi_expected + expected, data + total, i + 1); expected += i + 1;
+            if (split) {
+                b[count++] = (struct vav4l2_buffer){.type = VASliceParameterBufferType, .size = sizeof(*params), .data = params + i};
+                b[count++] = (struct vav4l2_buffer){.type = VASliceDataBufferType, .size = i + 1, .data = data + total};
+            }
+            total += i + 1;
+        }
+        if (!split) {
+            b[count++] = (struct vav4l2_buffer){.type = VASliceParameterBufferType, .size = sizeof(*params), .num_elements = tiles, .data = params};
+            b[count++] = (struct vav4l2_buffer){.type = VASliceDataBufferType, .size = total, .data = data};
+        }
+        for (unsigned i = 0; i < count; i++) batch[i] = b + i;
+        struct vav4l2_surface surfaces[2] = {{.surface_id = 0, .status = VASurfaceRendering}, {.surface_id = 1, .status = VASurfaceReady, .has_pic = 1, .buf_index = 1, .timestamp = 17}};
+        struct vav4l2_context c = {.driver_data = dd, .current_surface = surfaces, .v4l2_fd = 8, .request_fd = 9, .streamed = 1,
+            .n_free_out = 1, .output_buf_ptr = {output}, .output_buf_size = sizeof(output), .capture_bufs_allocd = 4};
+        surfaces[1].capture_ctx = &c; dd->surfaces[0] = surfaces; dd->surfaces[1] = surfaces + 1;
+        vav4l2_av1_dpb_model_reset(&c); c.av1.model_active = inter; c.av1.grain_checked = 1;
+        for (unsigned i = 0; i < 8; i++) { p.ref_frame_map[i] = 1; c.av1.slot_buf[i] = inter ? 1 : -1; }
+        c.av1.buf_owner[1] = 1; submitted = ioctls = 0; multi_tiles = tiles; multi_bytes = expected; normalize_capture = 1;
+        vav4l2_set_ioctl_hook(controls);
+        if (prefix && inter) {
+            c.av1.header.valid = 1; c.av1.header.frame_id_bits = 8;
+            expect(vav4l2_av1_translate(&c, batch, count) == VA_STATUS_ERROR_UNIMPLEMENTED && !ioctls && !submitted,
+                "raw-group-does-not-bypass-known-frame-ID-metadata");
+            c.av1.header.valid = 0; c.av1.header.frame_id_bits = 0;
+        }
+        expect(vav4l2_av1_translate(&c, batch, count) == VA_STATUS_SUCCESS && submitted == 1, "raw-multi-key-and-inter-submit");
+        expect(submitted_frame.tile_info.tile_size_bytes == (prefix ? prefix : 4) && submitted_frame.refresh_frame_flags == (inter ? 2 : 255), "raw-multi-controls-and-CDF-state");
+        unsigned offset = 0;
+        for (unsigned i = 0; i < tiles; i++) {
+            if (i && i + 1 < tiles) offset += prefix ? prefix : 4;
+            expect(multi_entries[i].tile_offset == offset && multi_entries[i].tile_size == i + 1 && multi_entries[i].tile_row == i / 2 && multi_entries[i].tile_col == i % 2, "raw-multi-entry-relative-to-submitted-bytes");
+            offset += i + 1;
+        }
+        c.output_buf_size = 1; ioctls = submitted = 0;
+        expect(vav4l2_av1_translate(&c, batch, count) == VA_STATUS_ERROR_INVALID_PARAMETER && !ioctls && !submitted, "multi-overflow-before-ioctl");
+        vav4l2_av1_dpb_model_reset(&c);
+    }
+    multi_tiles = normalize_capture = 0; vav4l2_set_ioctl_hook(NULL); free(dd);
+}
+static void maximum_tiles(void)
+{
+    VADecPictureParameterBufferAV1 p = picture(4096, 4096, 64, 8); p.primary_ref_frame = 7; p.pic_info_fields.bits.show_frame = 1;
+    VASliceParameterBufferAV1 params[V4L2_AV1_MAX_TILE_COUNT]; uint8_t data[V4L2_AV1_MAX_TILE_COUNT], output[4096];
+    unsigned expected = 0;
+    for (unsigned i = 0; i < V4L2_AV1_MAX_TILE_COUNT; i++) {
+        data[i] = 0x80 + i % 128;
+        params[i] = (VASliceParameterBufferAV1){.slice_data_size = 1, .slice_data_offset = i, .tile_row = i / 64, .tile_column = i % 64};
+        if (i && i + 1 < V4L2_AV1_MAX_TILE_COUNT) for (unsigned j = 0; j < 4; j++) multi_expected[expected++] = 0;
+        multi_expected[expected++] = data[i];
+    }
+    struct vav4l2_buffer b[] = {{.type = VAPictureParameterBufferType, .size = sizeof(p), .data = &p},
+        {.type = VASliceParameterBufferType, .size = sizeof(*params), .num_elements = V4L2_AV1_MAX_TILE_COUNT, .data = params},
+        {.type = VASliceDataBufferType, .size = sizeof(data), .data = data}}, *batch[] = {b, b + 1, b + 2};
+    struct vav4l2_context c = {.v4l2_fd = 8, .request_fd = 9, .streamed = 1, .n_free_out = 1, .output_buf_ptr = {output}, .output_buf_size = sizeof(output)};
+    c.av1.grain_checked = 1; multi_tiles = V4L2_AV1_MAX_TILE_COUNT; multi_bytes = expected; submitted = 0;
+    vav4l2_set_ioctl_hook(controls);
+    expect(vav4l2_av1_translate(&c, batch, 3) == VA_STATUS_SUCCESS && submitted == 1 && submitted_frame.tile_info.tile_cols == 64 &&
+        submitted_frame.tile_info.tile_rows == 8 && multi_entries[511].tile_offset == expected - 1, "UAPI-maximum-512-tile-array-and-64-column-grid");
+    multi_tiles = 0; vav4l2_set_ioctl_hook(NULL);
 }
 static void completion(void)
 {
@@ -495,7 +580,7 @@ static void metadata(void)
 }
 int main(void)
 {
-    geometry(); payload(); reject_before_ioctl(); completion(); normalized_references(); metadata(); delayed_readback(); deferred_references();
+    geometry(); payload(); reject_before_ioctl(); raw_multi(); maximum_tiles(); completion(); normalized_references(); metadata(); delayed_readback(); deferred_references();
     printf("AV1 tile failures: %d\n", failures);
     return failures != 0;
 }

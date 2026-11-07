@@ -23,7 +23,7 @@
 struct vav4l2_av1_pending {
     struct v4l2_ctrl_av1_frame frame;
     struct v4l2_ctrl_av1_film_grain grain;
-    struct v4l2_ctrl_av1_tile_group_entry tiles[32];
+    struct v4l2_ctrl_av1_tile_group_entry tiles[V4L2_AV1_MAX_TILE_COUNT];
     int parents[8], capture;
     VASurfaceID surface;
     uint64_t timestamp;
@@ -403,7 +403,7 @@ static int av1_tile_axis(uint32_t *starts, uint32_t *widths, unsigned count,
     uint32_t pos = 0, step = 0;
     unsigned log2 = 0;
 
-    if (!count || count > 32 || count > sb_count)
+    if (!count || count > V4L2_AV1_MAX_TILE_COLS || count > sb_count)
         return -1;
     if (uniform) {
         while ((1u << log2) < count)
@@ -443,7 +443,7 @@ VAStatus vav4l2_av1_fill_tile_info(struct v4l2_av1_tile_info *info,
     int uniform = pic->pic_info_fields.bits.uniform_tile_spacing_flag;
 
     memset(info, 0, sizeof(*info));
-    if (!cols || !rows || cols > 32 || rows > 32 || cols * rows > 32 ||
+    if (!cols || !rows || cols > V4L2_AV1_MAX_TILE_COLS || rows > V4L2_AV1_MAX_TILE_ROWS || cols * rows > V4L2_AV1_MAX_TILE_COUNT ||
         pic->context_update_tile_id >= cols * rows || denom < 8 || denom > 16 ||
         pic->order_hint_bits_minus_1 > 7 || pic->pic_info_fields.bits.large_scale_tile)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -476,7 +476,7 @@ VAStatus vav4l2_av1_prepare_tiles(const VADecPictureParameterBufferAV1 *pic,
     unsigned grid = (unsigned)pic->tile_cols * pic->tile_rows;
     if (st != VA_STATUS_SUCCESS)
         return st;
-    if (!data || !size || !capacity || n > 32 || (n != grid && (n || grid != 1)))
+    if (!data || !size || !capacity || n > V4L2_AV1_MAX_TILE_COUNT || (n != grid && (n || grid != 1)))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     memset(entries, 0, sizeof(*entries) * grid);
     if (!n) {
@@ -924,12 +924,12 @@ static VAStatus av1_resolve_pending(struct vav4l2_context *ctx, const VADecPictu
     free(p); return VA_STATUS_SUCCESS;
 }
 
-VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
+static VAStatus av1_translate(struct vav4l2_context *ctx,
                               struct vav4l2_buffer **buffers,
-                              int num_buffers)
+                              int num_buffers, int raw_multi)
 {
     VADecPictureParameterBufferAV1 *pic_param = NULL;
-    const VASliceParameterBufferAV1 *tile_params[32];
+    const VASliceParameterBufferAV1 *tile_params[V4L2_AV1_MAX_TILE_COUNT];
     int n_tiles = 0;
     uint8_t *tile_data = NULL;
     uint32_t tile_data_size = 0;
@@ -945,9 +945,13 @@ VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
     }
     vav4l2_collect_decode_buffers(buffers, num_buffers, &cb);
     pic_param = cb.pic;
-    for (i = 0; i < cb.n_slice_params && i < 32; i++)
-        tile_params[i] = cb.slice_params[i];
-    n_tiles = cb.n_slice_params;
+    for (i = 0; i < num_buffers; i++) {
+        const struct vav4l2_buffer *b = buffers[i];
+        if (!b || b->type != VASliceParameterBufferType) continue;
+        unsigned n = b->num_elements ? b->num_elements : 1;
+        if (n > V4L2_AV1_MAX_TILE_COUNT - (unsigned)n_tiles) return VA_STATUS_ERROR_INVALID_PARAMETER;
+        for (unsigned j = 0; j < n; j++) tile_params[n_tiles++] = (const void *)((const uint8_t *)b->data + (size_t)j * b->size);
+    }
     /* FFmpeg supplies raw tile bytes here; complete OBUs are optional. */
     tile_data = (uint8_t *)cb.largest;
     tile_data_size = cb.largest_size;
@@ -958,9 +962,9 @@ VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
     VAStatus reference_status = vav4l2_av1_validate_references(ctx, pic_param);
     if (reference_status != VA_STATUS_SUCCESS) return reference_status;
     struct v4l2_av1_tile_info tile_info;
-    struct v4l2_ctrl_av1_tile_group_entry entries[32];
+    struct v4l2_ctrl_av1_tile_group_entry entries[V4L2_AV1_MAX_TILE_COUNT];
     uint32_t tile_start, tile_length;
-    if (cb.n_slice_params_seen > 32 || cb.n_slice_datas != 1 ||
+    if (cb.n_slice_params_seen > V4L2_AV1_MAX_TILE_COUNT || cb.n_slice_datas != 1 ||
         vav4l2_av1_prepare_tiles(pic_param, tile_params, n_tiles, tile_data,
                                 tile_data_size, ctx->output_buf_size, &tile_info,
                                 entries, &tile_start, &tile_length) != VA_STATUS_SUCCESS) {
@@ -990,7 +994,10 @@ VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
     struct vav4l2_av1_header header = ctx->av1.header;
     unsigned type = pic_param->pic_info_fields.bits.frame_type;
     int reset = type == V4L2_AV1_SWITCH_FRAME || (type == V4L2_AV1_KEY_FRAME && pic_param->pic_info_fields.bits.show_frame);
-    int raw_tiles = type == V4L2_AV1_INTER_FRAME && !header.valid && n_tiles == 1 && !tile_start && tile_length == tile_data_size;
+    /* A validated raw group may already contain its size fields. Its only
+     * prefix is the first tile's size; no frame metadata is discarded. */
+    int raw_group = n_tiles > 1 && tile_start == tile_info.tile_size_bytes && tile_length == tile_data_size - tile_start;
+    int raw_tiles = type == V4L2_AV1_INTER_FRAME && !header.valid && (raw_multi || raw_group || (n_tiles == 1 && !tile_start && tile_length == tile_data_size));
     int normalized = !reset && (ctx->av1.normalized || raw_tiles);
     VAStatus frame_status = av1_fill_frame_params(&frame, pic_param, ctx,
                           (const uint8_t *)cb.largest, cb.largest_size,
@@ -1152,3 +1159,60 @@ VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx,
 }
 
 const int vav4l2_has_av1 = 1;
+
+/* VA may submit tile bytes without AV1 size fields, including separate data
+ * buffers. Serialize size fields from the explicit VA ranges, never infer
+ * them from entropy bytes. Complete original groups retain their old path. */
+VAStatus vav4l2_av1_translate(struct vav4l2_context *ctx, struct vav4l2_buffer **buffers, int count)
+{
+    if (!ctx || !buffers || count < 1 || count > 256) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    struct vav4l2_collected cb;
+    for (int i = 0; i < count; i++) if (!buffers[i] || !buffers[i]->data ||
+        (buffers[i]->allocated_elements && buffers[i]->num_elements > buffers[i]->allocated_elements) ||
+        (buffers[i]->type == VAPictureParameterBufferType && buffers[i]->size < sizeof(VADecPictureParameterBufferAV1))) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    vav4l2_collect_decode_buffers(buffers, count, &cb);
+    const VADecPictureParameterBufferAV1 *p = cb.pic;
+    if (!p || (unsigned)p->tile_cols * p->tile_rows < 2) return av1_translate(ctx, buffers, count, 0);
+    unsigned tiles = (unsigned)p->tile_cols * p->tile_rows;
+    if (tiles > V4L2_AV1_MAX_TILE_COUNT || cb.n_slice_params_seen != (int)tiles) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    const uint8_t *data[V4L2_AV1_MAX_TILE_COUNT] = {0}; uint32_t sizes[V4L2_AV1_MAX_TILE_COUNT] = {0};
+    VASliceParameterBufferAV1 pending[V4L2_AV1_MAX_TILE_COUNT], params[V4L2_AV1_MAX_TILE_COUNT]; unsigned np = 0, total = 0; int raw = 1;
+    for (int i = 0; i < count; i++) {
+        struct vav4l2_buffer *b = buffers[i]; unsigned elements = b->num_elements ? b->num_elements : 1;
+        if (b->type == VASliceParameterBufferType) {
+            if (b->size < sizeof(*pending) || elements > V4L2_AV1_MAX_TILE_COUNT - np) return VA_STATUS_ERROR_INVALID_PARAMETER;
+            for (unsigned j = 0; j < elements; j++) memcpy(pending + np++, (const uint8_t *)b->data + (size_t)j * b->size, sizeof(*pending));
+        } else if (b->type == VASliceDataBufferType) {
+            uint64_t bytes = (uint64_t)b->size * elements; unsigned end = 0;
+            if (!np || bytes > UINT32_MAX) return VA_STATUS_ERROR_INVALID_PARAMETER;
+            for (unsigned j = 0; j < np; j++) {
+                const VASliceParameterBufferAV1 *t = pending + j; unsigned index = t->tile_row * p->tile_cols + t->tile_column;
+                if (t->tile_row >= p->tile_rows || t->tile_column >= p->tile_cols || data[index] || t->slice_data_flag != VA_SLICE_DATA_FLAG_ALL ||
+                    !t->slice_data_size || t->slice_data_offset > bytes || t->slice_data_size > bytes - t->slice_data_offset) return VA_STATUS_ERROR_INVALID_PARAMETER;
+                if (t->slice_data_offset != end) raw = 0;
+                end = t->slice_data_offset + t->slice_data_size;
+                if (t->slice_data_size > UINT32_MAX - total) return VA_STATUS_ERROR_INVALID_PARAMETER;
+                data[index] = (const uint8_t *)b->data + t->slice_data_offset; sizes[index] = t->slice_data_size; total += sizes[index];
+            }
+            if (end != bytes) raw = 0;
+            np = 0;
+        }
+    }
+    if (np) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    for (unsigned i = 0; i < tiles; i++) if (!data[i]) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!raw) return av1_translate(ctx, buffers, count, 0);
+    if (total > UINT32_MAX - 4 * (tiles - 1) || total + 4 * (tiles - 1) > ctx->output_buf_size) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    uint8_t *packed = malloc(total + 4 * (tiles - 1)); if (!packed) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    unsigned offset = 0;
+    for (unsigned i = 0; i < tiles; i++) {
+        if (i + 1 < tiles) for (unsigned j = 0; j < 4; j++) packed[offset++] = (sizes[i] - 1) >> (8 * j);
+        params[i] = (VASliceParameterBufferAV1){.slice_data_size = sizes[i], .slice_data_offset = offset,
+            .slice_data_flag = VA_SLICE_DATA_FLAG_ALL, .tile_row = i / p->tile_cols, .tile_column = i % p->tile_cols};
+        memcpy(packed + offset, data[i], sizes[i]); offset += sizes[i];
+    }
+    struct vav4l2_buffer normalized[] = {{.type = VAPictureParameterBufferType, .size = sizeof(*p), .data = (void *)p},
+        {.type = VASliceParameterBufferType, .size = sizeof(*params), .num_elements = tiles, .data = params},
+        {.type = VASliceDataBufferType, .size = offset, .data = packed}};
+    struct vav4l2_buffer *batch[] = {normalized, normalized + 1, normalized + 2};
+    VAStatus status = av1_translate(ctx, batch, 3, 1); free(packed); return status;
+}

@@ -2,7 +2,7 @@
 /* AV1 OBU normalization adapted from Radxa libva-v4l2; see NOTICE. */
 #include <limits.h>
 #include "bytestream.h"
-#define AV1_TILES 32
+#define AV1_TILES V4L2_AV1_MAX_TILE_COUNT
 static void av1_put(struct bits *b, unsigned n, uint32_t value)
 {
     if (n > 32 || (n < 32 && value >= (UINT32_C(1) << n))) { b->error = 1; return; }
@@ -78,7 +78,7 @@ static VAStatus picture_collect(struct vav4l2_context *ctx, struct vav4l2_buffer
     if (p->pic_info_fields.bits.large_scale_tile || p->anchor_frames_num)
         return VA_STATUS_ERROR_UNIMPLEMENTED;
     unsigned tiles = (unsigned)p->tile_cols * p->tile_rows;
-    if (!tiles || tiles > AV1_TILES || p->context_update_tile_id >= tiles || p->primary_ref_frame > 7 || p->cdef_bits > 3 ||
+    if (!tiles || tiles > AV1_TILES || p->tile_cols > V4L2_AV1_MAX_TILE_COLS || p->tile_rows > V4L2_AV1_MAX_TILE_ROWS || p->context_update_tile_id >= tiles || p->primary_ref_frame > 7 || p->cdef_bits > 3 ||
         p->order_hint_bits_minus_1 > 7 || p->current_frame != ctx->current_surface_id ||
         ctx->width < 128 || ctx->height < 128 || ctx->width > 4096 || ctx->height > 4096 ||
         p->frame_width_minus1 >= ctx->width || p->frame_height_minus1 >= ctx->height ||
