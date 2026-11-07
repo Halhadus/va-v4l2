@@ -18,7 +18,7 @@ Install the dependencies listed in `debian/control`, then:
 dpkg-buildpackage -us -uc -b
 ```
 
-The source and binary package are `libva-v4l2`. The driver installs into the architecture's multiarch `dri` directory. Native package builds run the hardware-free tests; hardware tests are never part of package creation. `DEB_BUILD_OPTIONS=nocheck` skips the native test run.
+The source and binary package are `libva-v4l2`. The generated runtime dependency uses the build libva release version, so a driver exporting a newer init ABI cannot be installed with an older loader. The driver installs into the architecture's multiarch `dri` directory. Native package builds run the hardware-free tests; hardware tests are never part of package creation. `DEB_BUILD_OPTIONS=nocheck` skips the native test run.
 
 ## musl and Alpine
 
@@ -45,3 +45,7 @@ DESTDIR="$PWD/stage" meson install -C build-cross
 ```
 
 Tests may be compiled for the target without being executed on the build machine. Run them on the target, or configure an appropriate executable wrapper before using `meson test`. Debian uses `dpkg-buildpackage -a<architecture> -us -uc -b` with a configured cross toolchain and dependencies. The package recipe skips target test execution during a cross build.
+
+## Coverage-guided parser tests
+
+Clang with libFuzzer can build an instrumented packet/API-lifecycle target with `-Dfuzzing=true`. Meson includes a bounded smoke campaign in the existing unit suite. The normal build also runs the same entrypoint against deterministic seeds and a bounded surface/image/context lifecycle; that seed replay is not coverage-guided fuzzing. Saved crash inputs can be replayed with `build/packet_fuzz_seeds /path/to/input`. Test targets are not installed.

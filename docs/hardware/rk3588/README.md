@@ -6,7 +6,7 @@ The table describes the supplied RK3588 inventory and qualification evidence, no
 | --- | --- | --- | --- |
 | H.264 / HEVC decode | Rockchip MPP lists RK3588's high-resolution decoder and 10-bit-capable decode blocks | S264/S265; profiles/geometry and NV12/NV15/NV16/NV20 depend on selected SPS/node | Qualified in the recorded run, including reference pictures, packet layouts and paired fields |
 | VP8 / MPEG-2 decode | Vendor legacy VPU paths | Hantro stateless VP8F/MG2S | Implemented |
-| AV1 decode | Separate AV1 block/vendor path | Separate decoder node | Experimental, opt-in; basic 8/10-bit and single-tile matrix fixtures passed |
+| AV1 decode | Separate AV1 block/vendor path | Separate decoder node | Experimental, opt-in; basic 8/10-bit, single-tile and selected tiled matrix fixtures passed |
 | VP9 decode | Vendor high-resolution decoder path | VP9F is in this custom-kernel inventory; do not infer this from generic upstream version numbers | Profile 0/2 passed the eight-frame decode fixtures in the recorded run |
 | H.264 / HEVC / VP8 encode | Vendor codec blocks exist; availability is chip/backend dependent | No corresponding encoder nodes in the supplied inventory | Kernel interface missing for these paths; no VA encoder advertised |
 | JPEG encode | Vendor VPU/JPEG encoder paths | JPEG CAPTURE with YUV420M/NV12M and packed-422 raw menu entries | Four 420 public inputs implemented; packed-422 input remains bridge work |
@@ -24,21 +24,23 @@ The vendor comparison records silicon capabilities. Features without a correspon
 
 ## Test results
 
-The latest hardware report, `run-8_44ac7t`, ran on an Orange Pi 5 Plus with aarch64 kernel `7.3.1+unreleased-arm64`. The source was commit `2fd283416fdc20ea35c6706fe7453fb47418838f` with local changes. Driver SHA256: `373f87ce53e1f583911e74f3666f69700135ded9f51bd7bce64fcf0fd1faa9ad`. The run used `VAV4L2_GPU_COPY=0`, `VAV4L2_ADVERTISE_AV1=1` and `VAV4L2_TEST_AV1_TILES=0`.
+The latest hardware report, `run-_y3z30v9`, ran on an Orange Pi 5 Plus with aarch64 kernel `7.3.1+unreleased-arm64`. The source was commit `6af15175c65e248786e5352b50e76c475f2f7138` with local changes. Driver SHA256: `3081193ca7e0e944aa9e377897c6ef679d2cfe1c9e296d3bbe821b449f66ee84`. The run used `VAV4L2_GPU_COPY=0`, `VAV4L2_ADVERTISE_AV1=1` and `VAV4L2_TEST_AV1_TILES=1`.
 
 | Checks | Result |
 | --- | --- |
-| Main unit suite | 69/69 passed, including NV12/P010 retained-export lifetime regressions |
-| H.264, HEVC Main/Main10, VP9 Profile 0/2 and VP8 | Eight basic frames per profile, pixel-exact |
-| MPEG-2 | Eight basic frames; maximum sample delta 2, mean 0.0081759983, within the existing IDCT tolerance |
+| Main unit suite | 73/73 passed |
+| H.264, H.264 POC1 CAVLC/CABAC, HEVC Main/Main10, VP9 Profile 0/2 and VP8 | Eight basic frames per profile/vector, pixel-exact |
+| MPEG-2 | Eight basic frames within the existing maximum 4 / mean 0.5 IDCT tolerance |
 | AV1 8/10-bit, opt-in | Eight basic frames per depth, pixel-exact |
-| AV1 native and GBM matrices | AOM and SVT 60/60, default 30/30 and 4K 8/8 frames per mode, pixel-exact |
-| Other native and GBM matrix cases | Selected decode, JPEG, VPP and unit checks passed |
+| Per-codec decode and interop | All 52 selected basic, default-export, forced-GBM export and padded/canonical import cases passed; eight frames per case, with the existing MPEG-2 tolerance |
+| AV1 default-export and GBM matrices | AOM and SVT 60/60, default 30/30 and 4K 8/8 frames per mode, pixel-exact |
+| AV1 tiled matrices | 2x1, 4x1, 8x1 and 2x2 grids; 60/60 frames per grid and mode, pixel-exact |
+| Other default-export and GBM matrix cases | 44/44 checks per mode, including selected decode, JPEG, VPP and unit checks |
 | Image and PRIME transfers | Selected checks passed, including all 22 formats in the PRIME3 completion group |
 | Imported targets, direct CAPTURE and renderer | Selected groups passed; renderer 20 PASS / 1 SKIP per mode |
-| Overall | 1483 PASS / 0 FAIL / 62 SKIP; complete report, exit 0 |
+| Overall | 1542 PASS / 0 FAIL / 62 SKIP; complete report, exit 0 |
 
-Counts include group gates and component checks across native-export and GBM modes. Skips cover unavailable renderer/transport combinations. AV1 remains experimental: the raw-inter reference path is limited to the documented single-tile case; these results do not qualify tiled AV1, arbitrary syntax or other kernels. See [decoding](../../decoding.md). Hardware decoding used the Request backend with GPU copying disabled. The full-map AV1 cases exercised deferred replay: SVT used two replays and the default stream used 22 per mode.
+Counts include group gates and component checks across default-export and GBM modes. Extra coherent diagnostic matrices run only after a primary matrix failure and were not needed in this run. Skips cover unavailable renderer/transport combinations. Default-export permits native EXPBUF where supported; AV1 uses persistent surface-owned GBM storage. AV1 remains experimental: these results qualify the recorded tile grids and streams, not arbitrary syntax, the full 512-tile bound or other kernels. See [decoding](../../decoding.md). Hardware decoding used the Request backend with GPU copying disabled; stateful hardware and successful GPU copying are not qualified by this report.
 
 ## Extended regression profile
 
