@@ -460,7 +460,9 @@ vav4l2_create_config(VADriverContextP ctx,
         if (profile_rt_formats[i].profile == profile)
             supported_rt = profile_rt_formats[i].rt_format;
     if (profile == VAProfileNone) supported_rt |= vav4l2_vpp_extra_rt_formats(driver_data);
-    rt = profile == VAProfileHEVCMain10 ? VA_RT_FORMAT_YUV420_10 : supported_rt & (~supported_rt + 1u);
+    /* A decode profile can cover multiple bit depths. Let clients choose
+     * the matching surface format when no RT restriction was supplied. */
+    rt = entrypoint == VAEntrypointVLD ? supported_rt : supported_rt & (~supported_rt + 1u);
     for (int i = 0; i < num_attribs; i++) {
         if (attrib_list[i].type == VAConfigAttribRTFormat) {
             rt = attrib_list[i].value;
@@ -2052,12 +2054,19 @@ vav4l2_query_surface_error(VADriverContextP ctx,
                            VAStatus error_status,
                            void **error_info)
 {
-    (void)error_status;
     if (!error_info) return VA_STATUS_ERROR_INVALID_PARAMETER;
     *error_info = NULL;
+    if (error_status != VA_STATUS_ERROR_DECODING_ERROR && error_status != VA_STATUS_ERROR_HW_BUSY && error_status != VA_STATUS_SUCCESS)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
     pthread_mutex_lock(&vav4l2_api_lock);
-    VAStatus st = vav4l2_surface_by_id(ctx->pDriverData, render_target) ?
-        VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_SURFACE;
+    struct vav4l2_surface *surface = vav4l2_surface_by_id(ctx->pDriverData, render_target);
+    VAStatus st = surface ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_SURFACE;
+    if (surface) {
+        /* Public V4L2 buffers report corruption, not macroblock ranges or
+         * recovered resets. Return an empty terminated detail array. */
+        surface->decode_error_end = (VASurfaceDecodeMBErrors){.status = -1};
+        *error_info = &surface->decode_error_end;
+    }
     pthread_mutex_unlock(&vav4l2_api_lock);
     return st;
 }

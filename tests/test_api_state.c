@@ -129,6 +129,14 @@ int main(void)
            "surface-error-query-validates-id");
     expect(v.vaQuerySurfaceError(&ctx, ids[0], VA_STATUS_ERROR_DECODING_ERROR, NULL) == VA_STATUS_ERROR_INVALID_PARAMETER,
            "null-error-info-output");
+    const VAStatus error_statuses[] = {VA_STATUS_SUCCESS, VA_STATUS_ERROR_HW_BUSY, VA_STATUS_ERROR_DECODING_ERROR};
+    for (unsigned i = 0; i < sizeof(error_statuses) / sizeof(error_statuses[0]); i++) {
+        expect(v.vaQuerySurfaceError(&ctx, ids[0], error_statuses[i], &error) == VA_STATUS_SUCCESS && error, "surface-error-query-returns-array");
+        VASurfaceDecodeMBErrors empty = {.status = -1};
+        expect(error && !memcmp(error, &empty, sizeof(empty)), "surface-error-terminator-does-not-invent-MB-or-reset-details");
+    }
+    expect(v.vaQuerySurfaceError(&ctx, ids[0], VA_STATUS_ERROR_INVALID_PARAMETER, &error) == VA_STATUS_ERROR_INVALID_PARAMETER && !error,
+           "surface-error-query-validates-requested-status");
     snprintf(dd->dev_h264, sizeof(dd->dev_h264), "%s", "/dev/mock-h264-profile-menu");
     dd->h264_profiles_known = 1;
     dd->h264_profiles = (1u << V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE) | (1u << V4L2_MPEG_VIDEO_H264_PROFILE_MAIN) |
@@ -155,6 +163,31 @@ int main(void)
     expect(v.vaCreateConfig(&ctx, VAProfileHEVCMain10, VAEntrypointVLD, NULL, 0, &config) == VA_STATUS_SUCCESS,
         "hevc-main10-menu-profile-is-usable");
     if (config != VA_INVALID_ID) v.vaDestroyConfig(&ctx, config);
+    snprintf(dd->dev_av1, sizeof(dd->dev_av1), "%s", "/dev/mock-av1-formats");
+    const VAProfile mixed_profiles[] = {VAProfileAV1Profile0, VAProfileHEVCMain10, VAProfileH264High422};
+    const unsigned mixed_formats[] = {VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10,
+        VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10, VA_RT_FORMAT_YUV422 | VA_RT_FORMAT_YUV422_10};
+    for (unsigned p = 0; p < sizeof(mixed_profiles) / sizeof(*mixed_profiles); p++) for (unsigned explicit_rt = 0; explicit_rt < 3; explicit_rt++) {
+        unsigned low = mixed_formats[p] & (~mixed_formats[p] + 1u);
+        unsigned expected = explicit_rt == 1 ? low : explicit_rt == 2 ? mixed_formats[p] ^ low : mixed_formats[p];
+        VAConfigAttrib requested = {.type = VAConfigAttribRTFormat, .value = expected};
+        config = VA_INVALID_ID;
+        VAStatus status = v.vaCreateConfig(&ctx, mixed_profiles[p], VAEntrypointVLD, explicit_rt ? &requested : NULL, explicit_rt ? 1 : 0, &config);
+        expect(status == VA_STATUS_SUCCESS, "mixed-depth-decode-config");
+        if (status != VA_STATUS_SUCCESS) continue;
+        VAConfigAttrib actual[8]; int n = 0; VAProfile profile; VAEntrypoint entry;
+        expect(v.vaQueryConfigAttributes(&ctx, config, &profile, &entry, actual, &n) == VA_STATUS_SUCCESS && n &&
+            actual[0].type == VAConfigAttribRTFormat && actual[0].value == expected, "decode-config-keeps-default-or-explicit-RT-mask");
+        VASurfaceAttrib formats[32]; unsigned count = sizeof(formats) / sizeof(*formats), found = 0;
+        expect(v.vaQuerySurfaceAttributes(&ctx, config, formats, &count) == VA_STATUS_SUCCESS, "mixed-depth-surface-attributes");
+        for (unsigned i = 0; i < count; i++) if (formats[i].type == VASurfaceAttribPixelFormat) {
+            unsigned fourcc = formats[i].value.value.i;
+            found |= fourcc == VA_FOURCC_NV12 || fourcc == VA_FOURCC_YUY2 ? low :
+                fourcc == VA_FOURCC_P010 || fourcc == VA_FOURCC_Y210 ? mixed_formats[p] ^ low : 0;
+        }
+        expect(found == expected, "surface-formats-match-selected-decode-depths");
+        v.vaDestroyConfig(&ctx, config);
+    }
     pthread_t workers[4]; struct api_job jobs[4] = {{0}}; unsigned count = 0;
     for (; count < 4; count++) { jobs[count].driver = &ctx; if (pthread_create(&workers[count], NULL, surface_stress, &jobs[count])) break; }
     expect(count == 4, "concurrent-surface-stress-threads");

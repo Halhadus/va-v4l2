@@ -137,6 +137,7 @@ struct vav4l2_surface {
     struct vav4l2_prime_import *prime;
     int prime_capture_valid; /* CPU readback must not discard the native DPB reference */
     int gbm_writable, gbm_external_fd;
+    VASurfaceDecodeMBErrors decode_error_end;
 };
 
 /* Parameter buffer */
